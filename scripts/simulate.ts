@@ -128,6 +128,9 @@ async function race(fieldIds: Map<string, string>) {
     net_worth: '600000',
   });
 
+  // Seats the race really takes stay taken (they're in rep_seats), so the
+  // counter is restored to its old value plus those seats.
+  let takenInRace = 0;
   try {
     const a = lead('Laura', 'Perez');
     const b = lead('Daniel', 'Cruz');
@@ -135,6 +138,7 @@ async function race(fieldIds: Map<string, string>) {
 
     console.log(`\n=== race: Ana has ${ana.max_open_leads - 1} of ${ana.max_open_leads} leads, two Miami leads fire at once`);
     const [ra, rb] = await Promise.all([fire(idA, a), fire(idB, b)]);
+    takenInRace = [ra, rb].filter((r) => r.rep === ana.full_name).length;
     for (const [name, r] of [['Laura', ra], ['Daniel', rb]] as const) {
       console.log(`${name}: ${r.outcome}${r.rep ? ` -> ${r.rep}` : ''}`);
       if (r.outcome !== 'assigned') console.log(`  - ${r.reasons?.at(-1)}`);
@@ -143,7 +147,7 @@ async function race(fieldIds: Map<string, string>) {
     const after = await db.repByEmail(ana.email);
     console.log(`Ana now: ${after?.open_leads} of ${after?.max_open_leads} (never above the limit)`);
   } finally {
-    await db.setOpenLeads(ana.email, original);
+    await db.setOpenLeads(ana.email, original + takenInRace);
   }
 }
 
