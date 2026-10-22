@@ -25,6 +25,9 @@ describe('payloads', () => {
       parseOpportunityPayload({ customData: { opportunity_id: 'opp1', status: 'open', assigned_to_user_id: 'u42' } }),
     ).toMatchObject({ assigned_to_user_id: 'u42' });
     expect(() => parseOpportunityPayload({ opportunity_id: 'opp1', status: 'archived' })).toThrow();
+    // GHL's merge field renders the UI label "Abandon"
+    expect(parseOpportunityPayload({ opportunity_id: 'opp1', status: 'Abandon' }).status).toBe('abandoned');
+    expect(parseOpportunityPayload({ opportunity_id: 'opp1', status: 'abandoned' }).status).toBe('abandoned');
     expect(parseOpportunityPayload({ opportunity_id: 'opp1', status: 'won', contact_id: 'c9' }).contact_id).toBe('c9');
     expect(parseOpportunityPayload({ opportunity_id: 'opp1', status: 'won', contact_id: '' }).contact_id).toBeUndefined();
     expect(() => parseOpportunityPayload({ opportunity_id: 'opp1', status: 'won', contact_id: '../x' })).toThrow();
