@@ -28,22 +28,57 @@ export function normalizeState(input: string | null | undefined): string | undef
   return STATES[cleaned.toLowerCase().replace(/\s+/g, ' ')];
 }
 
+// Lowest real ZIP is 00501; anything below is a typo or a blank number field.
+const MIN_ZIP = 501;
+
 export function normalizeZip(input: string | number | null | undefined): string | undefined {
   if (input === null || input === undefined) return undefined;
-  const digits = String(input).split('-')[0]!.replace(/\D/g, '');
-  if (digits.length === 0 || digits.length > 5) return undefined;
-  // A ZIP stored as a number loses its leading zero (07102 -> 7102).
-  return digits.padStart(5, '0');
+  if (typeof input === 'number') {
+    // A ZIP stored as a number loses its leading zero (07102 -> 7102).
+    return Number.isInteger(input) && input >= MIN_ZIP && input <= 99_999 ? String(input).padStart(5, '0') : undefined;
+  }
+  // "33130", "33130-1234", "331301234", or a number field that lost its zero: "7102".
+  // Letters or stray characters are a typo ("3313O"), never stripped into another ZIP.
+  const text = input.trim();
+  const match = text.match(/^(\d{5})(?:-?\d{4})?$/) ?? text.match(/^(\d{3,4})$/);
+  if (!match) return undefined;
+  const digits = match[1]!;
+  return Number(digits) >= MIN_ZIP ? digits.padStart(5, '0') : undefined;
 }
 
-// One amount: "250000", "$250k", "1.2M", "1.2 million", "250 thousand".
+// Amounts above this are not a real answer (a typo or junk), so a person decides.
+const MAX_AMOUNT = 1_000_000_000_000;
+
+/** A money value from a form or the AI that can be trusted: finite, not negative, not absurd. */
+export const validAmount = (value: number | null | undefined): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_AMOUNT ? value : undefined;
+
+// A number written with US or European separators:
+//   "250000", "250,000", "250,000.50", "1.5"          (US)
+//   "1.000.000", "250.000,50", "1,5"                  (European: dots group, comma is decimal)
+// "250.000" alone is ambiguous (250 or 250,000?), so it is not read.
+function parseNumber(text: string): number | undefined {
+  if (/^\d+$/.test(text)) return Number(text);
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(text)) return Number(text.replace(/,/g, ''));
+  if (/^\d{1,3}(\.\d{3}){2,}(,\d+)?$/.test(text) || /^\d{1,3}\.\d{3},\d+$/.test(text)) {
+    return Number(text.replace(/\./g, '').replace(',', '.'));
+  }
+  if (/^\d{1,3}\.\d{3}$/.test(text)) return undefined;
+  if (/^\d+\.\d+$/.test(text)) return Number(text);
+  if (/^\d+,\d{1,2}$/.test(text)) return Number(text.replace(',', '.'));
+  return undefined;
+}
+
+// One amount: "250000", "$250k", "1.2M", "1,5M", "1.2 million", "250 thousand".
 function parseAmount(text: string): number | undefined {
-  const match = text.match(/^(\d+(?:\.\d+)?)(k|thousand|m|mm|million)?$/);
+  const match = text.match(/^([\d.,]+)(k|thousand|m|mm|million)?$/);
   if (!match) return undefined;
-  const value = Number(match[1]);
+  const value = parseNumber(match[1]!);
+  if (value === undefined) return undefined;
   const unit = match[2];
   const multiplier = unit === 'k' || unit === 'thousand' ? 1_000 : unit ? 1_000_000 : 1;
-  return Math.round(value * multiplier);
+  // Down, so a lead is never rounded up past a minimum (the epsilon absorbs float error)
+  return validAmount(Math.floor(value * multiplier + 1e-6));
 }
 
 // Dropdown answers are often ranges or open ends. The lowest amount the lead
@@ -52,9 +87,9 @@ function parseAmount(text: string): number | undefined {
 //   "under $50k" -> undefined (no lower bound, a person decides)
 export function parseMoney(input: string | number | null | undefined): number | undefined {
   if (input === null || input === undefined) return undefined;
-  if (typeof input === 'number') return Number.isFinite(input) && input >= 0 ? input : undefined;
+  if (typeof input === 'number') return validAmount(input);
 
-  const text = input.trim().toLowerCase().replace(/[$,\s]/g, '').replace(/usd/g, '');
+  const text = input.trim().toLowerCase().replace(/[$\s]/g, '').replace(/usd/g, '');
   if (/^(under|lessthan|below|upto|<)/.test(text)) return undefined;
 
   const openEnded = text.replace(/^(over|morethan|above|atleast|>=?)/, '').replace(/(\+|ormore|andup|andabove)$/, '');
@@ -67,11 +102,13 @@ export function parseMoney(input: string | number | null | undefined): number | 
   if (lowValue === undefined || highValue === undefined || highValue < lowValue) return undefined;
   // "100-250k": the unit written on the upper bound applies to both.
   // "500-1m" is ambiguous (500k? 500m?), so a person decides.
-  const bareNumber = /^\d+(\.\d+)?$/;
-  if (bareNumber.test(low) && !bareNumber.test(high)) {
-    const highNumber = Number(high.match(/^[\d.]+/)?.[0]);
-    if (!(Number(low) <= highNumber)) return undefined;
-    return parseAmount(low + high.replace(/^[\d.]+/, ''));
+  const unitOf = (t: string) => t.match(/[a-z]+$/)?.[0];
+  const highUnit = unitOf(high);
+  if (!unitOf(low) && highUnit) {
+    const lowNumber = parseNumber(low);
+    const highNumber = parseNumber(high.slice(0, -highUnit.length));
+    if (lowNumber === undefined || highNumber === undefined || lowNumber > highNumber) return undefined;
+    return parseAmount(low + highUnit);
   }
   return lowValue;
 }

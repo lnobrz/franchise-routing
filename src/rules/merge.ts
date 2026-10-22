@@ -1,4 +1,4 @@
-import { normalizeLanguage, normalizeState, normalizeZip, parseMoney } from './normalize.js';
+import { normalizeLanguage, normalizeState, normalizeZip, parseMoney, validAmount } from './normalize.js';
 import type { AiExtraction } from '../ai/extract.js';
 import type { LeadFacts } from '../types.js';
 import type { LeadPayload } from '../payload.js';
@@ -45,8 +45,9 @@ export function mergeLead(form: LeadPayload, ai: AiExtraction | null, minConfide
     ),
     unitState: pick('Unit state', normalizeState(form.unit_state), normalizeState(ai?.unit_state), true),
     zip: pick('ZIP', normalizeZip(form.desired_territory_zip), normalizeZip(ai?.zip), true),
-    liquidCapital: pick('Liquid capital', parseMoney(form.liquid_capital), ai?.liquid_capital_usd ?? undefined, false),
-    netWorth: pick('Net worth', parseMoney(form.net_worth), ai?.net_worth_usd ?? undefined, false),
+    // AI amounts go through the same checks as the form (not negative, not absurd)
+    liquidCapital: pick('Liquid capital', parseMoney(form.liquid_capital), validAmount(ai?.liquid_capital_usd), false),
+    netWorth: pick('Net worth', parseMoney(form.net_worth), validAmount(ai?.net_worth_usd), false),
     language:
       pick(
         'Language',

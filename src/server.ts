@@ -24,14 +24,15 @@ const routeLead = createRouter({ db, ghl, extractor, config });
 // Header first; the customData field is a fallback for webhook actions that
 // cannot set headers. Compared in constant time.
 function isAuthorized(req: Request): boolean {
-  const provided =
-    req.header('x-webhook-secret') ?? (req.body?.customData?.webhook_secret as string | undefined) ?? '';
+  const fromBody: unknown = req.body?.customData?.webhook_secret;
+  const provided = req.header('x-webhook-secret') ?? (typeof fromBody === 'string' ? fromBody : '');
   const expected = Buffer.from(config.WEBHOOK_SECRET);
-  const given = Buffer.from(String(provided));
+  const given = Buffer.from(provided);
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
 
 app.get('/health', (_req, res) => {
@@ -74,7 +75,12 @@ app.post('/webhooks/opportunity', async (req, res) => {
       (change.assigned_to_user_id ? await ghl.emailForUserId(change.assigned_to_user_id) : null) ??
       // An id that isn't a CRM user (deleted, or a manager outside routing) frees the seat.
       (change.assigned_to_user_id ? `unknown-user:${change.assigned_to_user_id}` : null);
-    const seat = await db.opportunityChanged(change.opportunity_id, change.status, assignedEmail);
+    const seat = await db.opportunityChanged(
+      change.opportunity_id,
+      change.status,
+      assignedEmail,
+      change.contact_id ?? null,
+    );
     if (seat !== 'ignored' && seat !== 'unchanged') console.log(`[seat] ${change.opportunity_id} ${change.status} -> ${seat}`);
     res.json({ seat });
   } catch (error) {
@@ -91,6 +97,10 @@ app.post('/webhooks/opportunity', async (req, res) => {
 app.use((error: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
   if (error.type === 'entity.parse.failed') {
     res.status(400).json({ error: 'invalid json' });
+    return;
+  }
+  if (error.type === 'entity.too.large') {
+    res.status(413).json({ error: 'payload too large' });
     return;
   }
   console.error('[server] unhandled error:', error);
@@ -112,6 +122,8 @@ setInterval(async () => {
     if (recovered > 0) console.log(`[recover] ${recovered} stuck event(s) handled`);
     const released = await releaseWaiting({ db, ghl, config, routeLead });
     if (released > 0) console.log(`[release] ${released} lead(s) released`);
+    const purged = await db.purgeOldPayloads(config.PII_RETENTION_DAYS);
+    if (purged > 0) console.log(`[purge] personal data cleared from ${purged} old event(s)`);
   } catch (error) {
     console.error('[jobs] run failed:', error);
   } finally {

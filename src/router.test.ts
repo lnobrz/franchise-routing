@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ClaimLostError, createRouter } from './router.js';
 import type { Config } from './config.js';
 import type { Db } from './db.js';
-import type { GhlClient } from './ghl.js';
+import { GhlError, type GhlClient } from './ghl.js';
 import type { Extractor } from './ai/extract.js';
 import type { RepRow } from './types.js';
 
@@ -24,7 +24,8 @@ const ana: RepRow = {
 type Overrides = {
   claim?: string | null;
   reserve?: string | null;
-  failOpportunity?: boolean;
+  openSeat?: string | null;
+  failOpportunity?: Error;
   failAssign?: boolean;
   failDecision?: boolean;
   claimLost?: boolean;
@@ -33,7 +34,8 @@ type Overrides = {
 function setup(overrides: Overrides = {}) {
   const db = {
     claimEvent: vi.fn().mockResolvedValue(overrides.claim === undefined ? 'claim-1' : overrides.claim),
-    unclaimEvent: vi.fn().mockResolvedValue(undefined),
+    failEvent: vi.fn().mockResolvedValue(undefined),
+    openSeatRepForContact: vi.fn().mockResolvedValue(overrides.openSeat ?? null),
     setEventStatus: vi.fn().mockResolvedValue(!overrides.claimLost),
     states: vi.fn().mockResolvedValue(
       new Map([
@@ -59,7 +61,7 @@ function setup(overrides: Overrides = {}) {
     addTags: vi.fn().mockResolvedValue(undefined),
     addNote: vi.fn().mockResolvedValue(undefined),
     createOpportunity: overrides.failOpportunity
-      ? vi.fn().mockRejectedValue(new Error('GHL 500'))
+      ? vi.fn().mockRejectedValue(overrides.failOpportunity)
       : vi.fn().mockResolvedValue('opp1'),
   } as unknown as GhlClient & Record<string, ReturnType<typeof vi.fn>>;
 
@@ -112,18 +114,53 @@ describe('routeLead', () => {
     expect(ghl.createOpportunity).not.toHaveBeenCalled();
   });
 
-  it('frees the event and its seat when the first CRM write fails', async () => {
-    const { db, ghl, route } = setup({ failOpportunity: true });
-    await expect(route(lead, 'c1:abc')).rejects.toThrow('GHL 500');
-    expect(db.unclaimEvent).toHaveBeenCalledWith('c1:abc', 'claim-1');
+  it('keeps the event as failed, and frees its seat, when GHL refuses the opportunity', async () => {
+    const { db, ghl, route } = setup({ failOpportunity: new GhlError('GHL POST /opportunities/ failed with 400', 400, '') });
+    await expect(route(lead, 'c1:abc')).rejects.toThrow('400');
+    expect(db.failEvent).toHaveBeenCalledWith('c1:abc', 'claim-1', expect.stringContaining('400'));
     expect(ghl.assignContact).not.toHaveBeenCalled();
     expect(db.setEventStatus).not.toHaveBeenCalledWith('c1:abc', 'needs_attention', 'claim-1');
+  });
+
+  it('flags a person instead of retrying when the opportunity create may have gone through', async () => {
+    for (const failure of [new GhlError('GHL POST /opportunities/ failed with 502', 502, ''), new Error('timeout')]) {
+      const { db, ghl, route } = setup({ failOpportunity: failure });
+      await expect(route(lead, 'c1:abc')).rejects.toThrow();
+      expect(db.failEvent).not.toHaveBeenCalled();
+      expect(db.setEventStatus).toHaveBeenCalledWith('c1:abc', 'needs_attention', 'claim-1');
+      expect(ghl.addTags).toHaveBeenCalledWith('c1', ['routing:needs-attention']);
+    }
+  });
+
+  it('keeps the event as failed when something breaks before the CRM', async () => {
+    const { db, ghl, route } = setup();
+    (db.reps as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('reps: connection refused'));
+    await expect(route(lead, 'c1:abc')).rejects.toThrow('connection refused');
+    expect(db.failEvent).toHaveBeenCalledWith('c1:abc', 'claim-1', 'reps: connection refused');
+    expect(ghl.addTags).not.toHaveBeenCalled();
+  });
+
+  it('does not assign a contact that already holds a seat', async () => {
+    const { db, ghl, route } = setup({ openSeat: 'ana' });
+    const result = await route(lead, 'c1:def');
+    expect(result.outcome).toBe('needs_review');
+    expect(result.reasons?.at(-1)).toMatch(/already has an open assignment \(Ana Rodriguez\)/);
+    expect(db.reserveRep).not.toHaveBeenCalled();
+    expect(ghl.createOpportunity).not.toHaveBeenCalled();
+  });
+
+  it('names the opportunity when it cannot be linked to its seat', async () => {
+    const { db, route } = setup();
+    (db.attachOpportunity as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('timeout'));
+    await expect(route(lead, 'c1:abc')).rejects.toThrow(/opportunity opp1 created but not linked/);
+    expect(db.attachOpportunity).toHaveBeenCalledTimes(2);
+    expect(db.setEventStatus).toHaveBeenCalledWith('c1:abc', 'needs_attention', 'claim-1');
   });
 
   it('keeps the claim and flags a person when a write fails after the opportunity exists', async () => {
     const { db, ghl, route } = setup({ failAssign: true });
     await expect(route(lead, 'c1:abc')).rejects.toThrow('GHL 502');
-    expect(db.unclaimEvent).not.toHaveBeenCalled();
+    expect(db.failEvent).not.toHaveBeenCalled();
     expect(db.setEventStatus).toHaveBeenCalledWith('c1:abc', 'needs_attention', 'claim-1');
     expect(ghl.addTags).toHaveBeenCalledWith('c1', ['routing:needs-attention']);
     expect(ghl.addNote).toHaveBeenCalledWith('c1', expect.stringMatching(/Check this contact/));
@@ -132,7 +169,7 @@ describe('routeLead', () => {
   it('flags a person when the decision cannot be logged after the CRM was written', async () => {
     const { db, route } = setup({ failDecision: true });
     await expect(route(lead, 'c1:abc')).rejects.toThrow('saveDecision');
-    expect(db.unclaimEvent).not.toHaveBeenCalled();
+    expect(db.failEvent).not.toHaveBeenCalled();
     expect(db.setEventStatus).toHaveBeenCalledWith('c1:abc', 'needs_attention', 'claim-1');
   });
 
