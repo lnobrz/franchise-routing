@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { zodResponseFormat } from 'openai/helpers/zod';
+import { zodTextFormat } from 'openai/helpers/zod';
 import { z } from 'zod';
 
 // Reads the free-text "About you" answer and pulls out structured facts.
@@ -7,7 +7,7 @@ import { z } from 'zod';
 // The model never decides anything. It only fills in data; the routing rules
 // stay deterministic. Reliability comes from:
 //   - a fixed JSON schema the API is forced to follow (structured outputs)
-//   - temperature 0
+//   - temperature 0 on models that accept it
 //   - the prompt telling it to return null instead of guessing
 //   - zod validating the result again on our side
 //   - a confidence score: below the bar, its answers are ignored
@@ -26,7 +26,7 @@ export const AiExtractionSchema = z.object({
 
 export type AiExtraction = z.infer<typeof AiExtractionSchema>;
 
-const SYSTEM_PROMPT = `You extract facts from a franchise inquiry written by a prospect.
+const INSTRUCTIONS = `You extract facts from a franchise inquiry written by a prospect.
 
 Rules:
 - Only extract what the text explicitly states. If something is not stated, return null. Never guess.
@@ -40,25 +40,26 @@ export interface Extractor {
   extract(text: string): Promise<AiExtraction | null>;
 }
 
-export function createOpenAiExtractor(apiKey: string, model: string): Extractor {
-  const client = new OpenAI({ apiKey, timeout: 20_000, maxRetries: 2 });
+export const createOpenAiExtractor = (options: {
+  apiKey: string;
+  model: string;
+  temperature?: number; // leave undefined for reasoning models, which reject it
+}): Extractor => {
+  const client = new OpenAI({ apiKey: options.apiKey, timeout: 20_000, maxRetries: 2 });
 
   return {
-    async extract(text: string) {
+    async extract(text) {
       try {
-        const completion = await client.beta.chat.completions.parse({
-          model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: text.slice(0, 4_000) },
-          ],
-          response_format: zodResponseFormat(AiExtractionSchema, 'lead_extraction'),
+        const response = await client.responses.parse({
+          model: options.model,
+          instructions: INSTRUCTIONS,
+          input: text.slice(0, 4_000),
+          text: { format: zodTextFormat(AiExtractionSchema, 'lead_extraction') },
+          ...(options.temperature !== undefined && { temperature: options.temperature }),
         });
 
-        const message = completion.choices[0]?.message;
-        if (!message?.parsed) return null;            // refusal or empty
-        return AiExtractionSchema.parse(message.parsed); // validate again, never trust blindly
+        if (!response.output_parsed) return null;                // refusal or empty
+        return AiExtractionSchema.parse(response.output_parsed); // validate again, never trust blindly
       } catch (error) {
         // The AI is an enhancement, not a dependency: if it fails, routing
         // continues with the form fields only.
@@ -67,4 +68,4 @@ export function createOpenAiExtractor(apiKey: string, model: string): Extractor 
       }
     },
   };
-}
+};

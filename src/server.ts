@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
-import express, { type Request } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import { ZodError } from 'zod';
 import { loadConfig } from './config.js';
 import { Db } from './db.js';
@@ -12,7 +12,11 @@ import { eventKeyFor, parsePayload } from './payload.js';
 const config = loadConfig();
 const db = new Db(config.SUPABASE_URL, config.SUPABASE_SECRET_KEY);
 const ghl = new GhlClient(config.GHL_TOKEN, config.GHL_LOCATION_ID);
-const extractor = createOpenAiExtractor(config.OPENAI_API_KEY, config.OPENAI_MODEL);
+const extractor = createOpenAiExtractor({
+  apiKey: config.OPENAI_API_KEY,
+  model: config.OPENAI_MODEL,
+  temperature: config.AI_TEMPERATURE,
+});
 const routeLead = createRouter({ db, ghl, extractor, config });
 
 // GHL workflow webhooks are not signed, so the workflow sends a shared secret.
@@ -52,6 +56,16 @@ app.post('/webhooks/lead', async (req, res) => {
     console.error('[webhook] routing failed:', error);
     res.status(500).json({ error: 'routing failed' });
   }
+});
+
+// Malformed JSON and anything unexpected: a short JSON answer, never a stack trace.
+app.use((error: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+  if (error.type === 'entity.parse.failed') {
+    res.status(400).json({ error: 'invalid json' });
+    return;
+  }
+  console.error('[server] unhandled error:', error);
+  res.status(500).json({ error: 'internal error' });
 });
 
 app.listen(config.PORT, () => {

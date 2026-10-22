@@ -82,7 +82,7 @@ It reads the free-text "About you" answer, where people write things like *"I li
 in Newark but want to open in Miami, around 33130, I have about $250k"*, and turns
 it into structured data (`src/ai/extract.ts`). To keep it reliable:
 
-- Structured outputs with a fixed JSON schema, temperature 0
+- Structured outputs (Responses API) with a fixed JSON schema, temperature 0 on models that accept it
 - The prompt asks for `null` instead of guessing
 - The result is validated again with zod on our side
 - A confidence score: below the threshold, its answers are ignored
@@ -114,8 +114,10 @@ go to Carlos last week?" is one query.
 2. **GoHighLevel:** custom fields, the inquiry form, a pipeline, and users whose
    e-mails match the `reps` table. Create a Private Integration token with
    contacts, opportunities, users and custom fields scopes.
-3. **Environment:** `cp .env.example .env` and fill it in.
-4. **Run:** `npm install && npm run build && npm start` (or `npm run dev`).
+3. **Environment:** `cp .env.example .env` and fill it in. Node loads it natively.
+4. **Run:** Node 22+ (24 LTS recommended), then `npm install && npm run build && npm start` (or `npm run dev`).
+
+Stack: TypeScript 7 (strict), Node ESM, Express 5, Zod 4, OpenAI SDK 7, Supabase, Vitest.
 
 ### GHL workflow
 
