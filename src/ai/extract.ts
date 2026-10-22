@@ -40,23 +40,44 @@ export interface Extractor {
   extract(text: string): Promise<AiExtraction | null>;
 }
 
+type ResponsesClient = Pick<OpenAI, 'responses'>;
+
+// "400 Unsupported parameter: 'temperature' is not supported with this model."
+const rejectsTemperature = (error: unknown): boolean =>
+  /temperature/i.test((error as Error)?.message ?? '') && /unsupported|not supported/i.test((error as Error)?.message ?? '');
+
 export const createOpenAiExtractor = (options: {
   apiKey: string;
   model: string;
   temperature?: number; // leave undefined for reasoning models, which reject it
+  client?: ResponsesClient; // tests
 }): Extractor => {
-  const client = new OpenAI({ apiKey: options.apiKey, timeout: 20_000, maxRetries: 2 });
+  const client: ResponsesClient = options.client ?? new OpenAI({ apiKey: options.apiKey, timeout: 20_000, maxRetries: 2 });
+  // A model that rejects temperature (a setting left at 0 for a reasoning
+  // model) would turn the AI off for every lead; it is dropped instead.
+  let temperature = options.temperature;
+
+  const call = (text: string) =>
+    client.responses.parse({
+      model: options.model,
+      instructions: INSTRUCTIONS,
+      input: text.slice(0, 4_000),
+      text: { format: zodTextFormat(AiExtractionSchema, 'lead_extraction') },
+      ...(temperature !== undefined && { temperature }),
+    });
 
   return {
     async extract(text) {
       try {
-        const response = await client.responses.parse({
-          model: options.model,
-          instructions: INSTRUCTIONS,
-          input: text.slice(0, 4_000),
-          text: { format: zodTextFormat(AiExtractionSchema, 'lead_extraction') },
-          ...(options.temperature !== undefined && { temperature: options.temperature }),
-        });
+        let response;
+        try {
+          response = await call(text);
+        } catch (error) {
+          if (temperature === undefined || !rejectsTemperature(error)) throw error;
+          console.warn(`[ai] ${options.model} does not accept temperature; set AI_TEMPERATURE empty. Retrying without it.`);
+          temperature = undefined;
+          response = await call(text);
+        }
 
         if (!response.output_parsed) return null;                // refusal or empty
         return AiExtractionSchema.parse(response.output_parsed); // validate again, never trust blindly

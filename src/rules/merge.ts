@@ -57,5 +57,11 @@ export function mergeLead(form: LeadPayload, ai: AiExtraction | null, minConfide
       ) ?? 'English',
   };
 
+  // A ZIP the lead typed but that can't be read ("3313O") is not "no ZIP":
+  // routing by state would skip the territory's financial minimums.
+  if (form.desired_territory_zip !== undefined && facts.zip === undefined) {
+    conflicts.push(`ZIP: form says "${form.desired_territory_zip}", which is not a valid ZIP code`);
+  }
+
   return { facts, conflicts, filledByAi };
 }

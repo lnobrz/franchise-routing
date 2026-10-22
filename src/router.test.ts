@@ -92,6 +92,13 @@ describe('routeLead', () => {
     expect(db.setEventStatus).toHaveBeenLastCalledWith('c1:abc', 'done', 'claim-1');
   });
 
+  it('does not route a lead with an unreadable ZIP by state', async () => {
+    const { ghl, route } = setup();
+    const result = await route({ ...lead, desired_territory_zip: '3313O' }, 'c1:zip');
+    expect(result.outcome).toBe('needs_review');
+    expect(ghl.createOpportunity).not.toHaveBeenCalled();
+  });
+
   it('creates the opportunity before touching the contact', async () => {
     const { ghl, route } = setup();
     await route(lead, 'c1:abc');

@@ -219,6 +219,13 @@ describe('merging the form with the AI read', () => {
     expect(r.facts.zip).toBeUndefined();
   });
 
+  it('sends a typed but unreadable ZIP to a person instead of routing by state', () => {
+    const r = mergeLead({ contact_id: 'c', residence_state: 'FL', unit_state: 'FL', desired_territory_zip: '3313O' }, null, 0.7);
+    expect(r.facts.zip).toBeUndefined();
+    expect(r.conflicts[0]).toMatch(/"3313O", which is not a valid ZIP/);
+    expect(mergeLead({ contact_id: 'c', unit_state: 'FL' }, null, 0.7).conflicts).toEqual([]); // no ZIP at all is fine
+  });
+
   it('flags a conflict instead of choosing when form and text disagree', () => {
     const r = mergeLead({ contact_id: 'c', unit_state: 'TX' }, ai({ unit_state: 'FL' }), 0.7);
     expect(r.facts.unitState).toBe('TX');
