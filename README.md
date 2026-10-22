@@ -24,8 +24,11 @@ GHL form submitted
     -> load states, ZIP, territory, reps from Supabase
     -> decide()  pure function, no I/O
     -> reserve_rep()  atomic seat reservation in Postgres
-    -> write to GHL: assign contact, tags, opportunity, decision note
+    -> write to GHL: opportunity first, then assign contact, tags, decision note
     -> log the decision in Supabase
+
+GHL opportunity won / lost / abandoned / reassigned
+  -> GHL workflow: webhook -> opportunity_changed()  the rep's seat is given back or moved
 ```
 
 ## Why it doesn't depend on timing
@@ -45,8 +48,19 @@ This version removes the problem instead of waiting it out:
   at the same instant can't both see "7 of 8" and both take the last seat.
 - **Idempotent.** Each submission gets a key (contact id + hash of the answers).
   A GHL retry or a double click is recognized and ignored.
-- **Safe failure.** If the CRM write fails, the seat is released and the event is
-  freed so GHL's retry processes it cleanly.
+- **Safe failure.** Each event has a status (`processing`, `writing_crm`, `done`,
+  `needs_attention`) and a claim id. If something fails before the CRM is touched,
+  the claim and the seat are given back and GHL's retry starts clean. Once the
+  opportunity exists, a failure is never retried automatically (that could assign
+  the lead twice): the contact gets the `routing:needs-attention` tag and a note.
+- **Nothing lost on a restart.** Every `RELEASE_JOB_MINUTES` a recovery job looks
+  for events unfinished after `STALE_EVENT_MINUTES`. One that never reached the CRM
+  is routed again (its old claim and seat are taken over atomically); one that
+  stopped while writing the CRM is flagged for a person the same way.
+- **Seats come back.** Each seat is recorded in `rep_seats` with its opportunity.
+  When the opportunity is won, lost or abandoned the seat is freed; when it is
+  reassigned the seat moves to the new rep. Without this, every rep would end up
+  "full" and all leads would go to review.
 
 ## The rules
 
@@ -67,8 +81,10 @@ both states are checked:
 territories are blocked. A ZIP in a different state than the unit state goes to
 human review.
 
-**Financials.** Liquid capital and net worth are checked against the territory's
-minimums.
+**Financials.** Liquid capital and net worth are both checked against the territory's
+minimums; if either is missing or unreadable, the lead goes to a human. Dropdown
+answers are read conservatively: a range like "$100,000 - $250,000" counts as its
+lower bound, "$1M+" as $1M, and "Under $50k" (no lower bound) as unreadable.
 
 **Rep ranking (`src/rules/reps.ts`).** Active reps covering the unit state, then:
 language match (falls back to English if nobody speaks it), territory owner first,
@@ -111,6 +127,10 @@ go to Carlos last week?" is one query.
 ## Setup
 
 1. **Supabase:** run `supabase/schema.sql`, then `supabase/seed.sql` in the SQL editor.
+   A database created with an earlier version only needs
+   `supabase/migrations/001_seats_and_event_status.sql`; afterwards set each rep's
+   `open_leads` to their real number of open leads, since seats taken before the
+   migration aren't linked to an opportunity.
 2. **GoHighLevel:** custom fields, the inquiry form, a pipeline, and users whose
    e-mails match the `reps` table. Create a Private Integration token with
    contacts, opportunities, users and custom fields scopes.
@@ -143,6 +163,23 @@ body:
 If the webhook action can't set headers, the fields and a `webhook_secret` can go
 in its *Custom Data*; the server reads both shapes.
 
+A second workflow gives seats back. Trigger: *Opportunity Status Changed* and
+*Opportunity Changed* (assigned user), filtered to the routing pipeline. Action:
+*Webhook*, `POST` to `https://<your-domain>/webhooks/opportunity`, same secret header,
+body (pick the exact merge fields from the GHL picker; the names below are the usual ones):
+
+```json
+{
+  "opportunity_id": "{{opportunity.id}}",
+  "status": "{{opportunity.status}}",
+  "assigned_to_email": "{{user.email}}"
+}
+```
+
+`status` is one of `open`, `won`, `lost`, `abandoned`. The call is idempotent, so
+repeated or overlapping triggers are harmless. Contacts tagged
+`routing:needs-attention` are worth a smart list or a notification in GHL.
+
 ### Deploying on a VPS
 
 ```bash
@@ -150,6 +187,9 @@ npm ci && npm run build
 pm2 start deploy/ecosystem.config.cjs
 # HTTPS: point a subdomain at the server and use deploy/Caddyfile
 ```
+
+The app listens on `127.0.0.1` by default (`HOST`), so only Caddy on the same
+machine can reach it.
 
 ## Testing
 
@@ -167,7 +207,7 @@ form/text contradiction, and two leads racing for a rep's last seat.
 
 ```
 src/
-  server.ts              webhook endpoint, auth, release job timer
+  server.ts              webhook endpoints, auth, job timer
   router.ts              the single flow, start to finish
   rules/decide.ts        the routing decision (pure)
   rules/legal.ts         two-state franchise law check
@@ -176,10 +216,12 @@ src/
   rules/normalize.ts     messy input -> clean values
   ai/extract.ts          OpenAI structured extraction
   jobs/releaseWaiting.ts re-routes parked leads
+  jobs/recoverStuck.ts   re-runs or flags events a restart interrupted
   ghl.ts                 GoHighLevel API client with retries
   db.ts                  Supabase access
 supabase/
-  schema.sql             tables, constraints, reserve_rep(), RLS
+  schema.sql             tables, constraints, claims, seats, RLS
+  migrations/            upgrades for databases created earlier
   seed.sql               demo data
 scripts/simulate.ts      end-to-end scenarios against a running server
 ```

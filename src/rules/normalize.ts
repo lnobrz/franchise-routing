@@ -36,17 +36,44 @@ export function normalizeZip(input: string | number | null | undefined): string 
   return digits.padStart(5, '0');
 }
 
+// One amount: "250000", "$250k", "1.2M", "1.2 million", "250 thousand".
+function parseAmount(text: string): number | undefined {
+  const match = text.match(/^(\d+(?:\.\d+)?)(k|thousand|m|mm|million)?$/);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === 'k' || unit === 'thousand' ? 1_000 : unit ? 1_000_000 : 1;
+  return Math.round(value * multiplier);
+}
+
+// Dropdown answers are often ranges or open ends. The lowest amount the lead
+// certainly has is used, so nobody qualifies on the top of a range:
+//   "$100,000 - $250,000" -> 100000     "$1M+" / "over $1M" -> 1000000
+//   "under $50k" -> undefined (no lower bound, a person decides)
 export function parseMoney(input: string | number | null | undefined): number | undefined {
   if (input === null || input === undefined) return undefined;
   if (typeof input === 'number') return Number.isFinite(input) && input >= 0 ? input : undefined;
 
-  const text = input.trim().toLowerCase().replace(/[$,\s]/g, '').replace(/usd$/, '');
-  const match = text.match(/^(\d+(?:\.\d+)?)(k|m|mm)?$/);
-  if (!match) return undefined;
+  const text = input.trim().toLowerCase().replace(/[$,\s]/g, '').replace(/usd/g, '');
+  if (/^(under|lessthan|below|upto|<)/.test(text)) return undefined;
 
-  const value = Number(match[1]);
-  const multiplier = match[2] === 'k' ? 1_000 : match[2] ? 1_000_000 : 1;
-  return Math.round(value * multiplier);
+  const openEnded = text.replace(/^(over|morethan|above|atleast|>=?)/, '').replace(/(\+|ormore|andup|andabove)$/, '');
+  const [low, high, ...rest] = openEnded.split(/-|–|—|to/);
+  if (rest.length > 0 || low === undefined) return undefined;
+
+  const lowValue = parseAmount(low);
+  if (high === undefined) return lowValue;
+  const highValue = parseAmount(high);
+  if (lowValue === undefined || highValue === undefined || highValue < lowValue) return undefined;
+  // "100-250k": the unit written on the upper bound applies to both.
+  // "500-1m" is ambiguous (500k? 500m?), so a person decides.
+  const bareNumber = /^\d+(\.\d+)?$/;
+  if (bareNumber.test(low) && !bareNumber.test(high)) {
+    const highNumber = Number(high.match(/^[\d.]+/)?.[0]);
+    if (!(Number(low) <= highNumber)) return undefined;
+    return parseAmount(low + high.replace(/^[\d.]+/, ''));
+  }
+  return lowValue;
 }
 
 export type Language = 'English' | 'Spanish' | 'Portuguese';

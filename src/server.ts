@@ -7,7 +7,8 @@ import { GhlClient } from './ghl.js';
 import { createOpenAiExtractor } from './ai/extract.js';
 import { createRouter } from './router.js';
 import { releaseWaiting } from './jobs/releaseWaiting.js';
-import { eventKeyFor, parsePayload } from './payload.js';
+import { recoverStuck } from './jobs/recoverStuck.js';
+import { eventKeyFor, parseOpportunityPayload, parsePayload } from './payload.js';
 
 const config = loadConfig();
 const db = new Db(config.SUPABASE_URL, config.SUPABASE_SECRET_KEY);
@@ -58,6 +59,29 @@ app.post('/webhooks/lead', async (req, res) => {
   }
 });
 
+// A second GHL workflow (opportunity status changed / opportunity changed)
+// reports closed or reassigned opportunities, so the rep's seat is given back.
+app.post('/webhooks/opportunity', async (req, res) => {
+  if (!isAuthorized(req)) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+
+  try {
+    const change = parseOpportunityPayload(req.body);
+    const seat = await db.opportunityChanged(change.opportunity_id, change.status, change.assigned_to_email ?? null);
+    if (seat !== 'ignored' && seat !== 'unchanged') console.log(`[seat] ${change.opportunity_id} ${change.status} -> ${seat}`);
+    res.json({ seat });
+  } catch (error) {
+    if (error instanceof ZodError) {
+      res.status(400).json({ error: 'invalid payload', issues: error.issues });
+      return;
+    }
+    console.error('[webhook] opportunity update failed:', error);
+    res.status(500).json({ error: 'update failed' });
+  }
+});
+
 // Malformed JSON and anything unexpected: a short JSON answer, never a stack trace.
 app.use((error: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
   if (error.type === 'entity.parse.failed') {
@@ -68,20 +92,23 @@ app.use((error: Error & { type?: string }, _req: Request, res: Response, _next: 
   res.status(500).json({ error: 'internal error' });
 });
 
-app.listen(config.PORT, () => {
-  console.log(`[server] listening on :${config.PORT}`);
+app.listen(config.PORT, config.HOST, () => {
+  console.log(`[server] listening on ${config.HOST}:${config.PORT}`);
 });
 
-// Re-route leads whose state registration became active again.
+// Recover interrupted events, then re-route leads whose state registration
+// became active again.
 let jobRunning = false;
 setInterval(async () => {
   if (jobRunning) return;
   jobRunning = true;
   try {
+    const recovered = await recoverStuck({ db, ghl, config, routeLead });
+    if (recovered > 0) console.log(`[recover] ${recovered} stuck event(s) handled`);
     const released = await releaseWaiting({ db, ghl, config, routeLead });
     if (released > 0) console.log(`[release] ${released} lead(s) released`);
   } catch (error) {
-    console.error('[release] job failed:', error);
+    console.error('[jobs] run failed:', error);
   } finally {
     jobRunning = false;
   }

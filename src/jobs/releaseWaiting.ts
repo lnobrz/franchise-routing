@@ -25,20 +25,32 @@ export async function releaseWaiting(deps: {
   let released = 0;
 
   for (const lead of waiting) {
-    const residence = states.get(lead.residence_state);
-    const unit = states.get(lead.unit_state);
-    if (!residence || !unit || isStillWaiting(residence, unit, today)) continue;
+    // One lead failing must not stop the others; it is retried on the next run.
+    try {
+      const residence = states.get(lead.residence_state);
+      const unit = states.get(lead.unit_state);
+      if (!residence || !unit || isStillWaiting(residence, unit, today)) continue;
 
-    const payload = await db.eventPayload(lead.event_key);
-    if (!payload) continue;
+      const payload = await db.eventPayload(lead.event_key);
+      if (!payload) continue;
 
-    // Route first, then close the old decision: if routing fails, the lead stays
-    // in the waiting queue and is retried on the next run instead of being lost.
-    const result = await routeLead(payload, `${lead.event_key}:released:${Date.now()}`);
-    await db.resolveDecision(lead.id);
-    await ghl.removeTags(lead.contact_id, ['routing:waiting-registration']).catch(() => undefined);
-    console.log(`[release] ${lead.contact_id} re-routed -> ${result.outcome}`);
-    released++;
+      // A fixed key: if an earlier run routed this lead but couldn't close the
+      // old decision, the claim stops a second assignment and we only close it.
+      const releaseKey = `${lead.event_key}:released`;
+      const result = await routeLead(payload, releaseKey);
+      if (result.status === 'duplicate') {
+        const status = await db.eventStatus(releaseKey);
+        // Still running, or stuck before the CRM (the recovery job re-runs it).
+        if (status !== 'done' && status !== 'needs_attention') continue;
+      }
+
+      await db.resolveDecision(lead.id);
+      await ghl.removeTags(lead.contact_id, ['routing:waiting-registration']).catch(() => undefined);
+      console.log(`[release] ${lead.contact_id} re-routed -> ${result.outcome ?? 'already routed'}`);
+      released++;
+    } catch (error) {
+      console.error(`[release] ${lead.contact_id} failed, retrying next run:`, (error as Error).message);
+    }
   }
 
   return released;

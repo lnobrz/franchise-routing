@@ -7,6 +7,8 @@ if (existsSync('.env')) process.loadEnvFile('.env');
 
 const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
+  // Only the reverse proxy on the same machine should reach the app
+  HOST: z.string().default('127.0.0.1'),
 
   // Shared secret the GHL workflow sends in the x-webhook-secret header
   WEBHOOK_SECRET: z.string().min(24, 'use at least 24 random characters'),
@@ -27,6 +29,8 @@ const EnvSchema = z.object({
   // Time zone used for "today" in the registration expiry check
   BUSINESS_TIMEZONE: z.string().default('America/New_York'),
   RELEASE_JOB_MINUTES: z.coerce.number().int().positive().default(15),
+  // An event still unfinished after this long is treated as interrupted
+  STALE_EVENT_MINUTES: z.coerce.number().int().positive().default(10),
 });
 
 export type Config = z.infer<typeof EnvSchema>;
