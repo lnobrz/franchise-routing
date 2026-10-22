@@ -56,6 +56,23 @@ describe('normalize', () => {
     expect(parseMoney('1.2M')).toBe(1_200_000);
     expect(parseMoney('150,000')).toBe(150_000);
     expect(parseMoney('a lot')).toBeUndefined();
+    expect(parseMoney('1.2 million')).toBe(1_200_000);
+  });
+
+  it('uses the lower bound of ranges and open-ended dropdown answers', () => {
+    expect(parseMoney('$100,000 - $250,000')).toBe(100_000);
+    expect(parseMoney('$250K to $500K')).toBe(250_000);
+    expect(parseMoney('100-250k')).toBe(100_000);
+    expect(parseMoney('$1M+')).toBe(1_000_000);
+    expect(parseMoney('Over $1M')).toBe(1_000_000);
+    expect(parseMoney('500000 or more')).toBe(500_000);
+  });
+
+  it('leaves answers without a safe lower bound to a person', () => {
+    expect(parseMoney('Under $50k')).toBeUndefined();
+    expect(parseMoney('Less than $100,000')).toBeUndefined();
+    expect(parseMoney('500-1m')).toBeUndefined();
+    expect(parseMoney('$500,000 - $100,000')).toBeUndefined();
   });
 
   it('maps language names in three languages', () => {
@@ -212,6 +229,16 @@ describe('full decision', () => {
   it('sends a ZIP from another state to review', () => {
     const d = decide(base({ zip: { ...zip, state_code: 'GA' } }));
     expect(d.outcome).toBe('needs_review');
+  });
+
+  it('asks a human when only one of the two financials is known', () => {
+    const { netWorth: _, ...withoutNetWorth } = base().facts;
+    const d = decide(base({ facts: withoutNetWorth }));
+    expect(d.outcome).toBe('needs_review');
+    expect(d.reasons.at(-1)).toMatch(/net worth not provided/);
+
+    const { liquidCapital: __, ...withoutLiquid } = base().facts;
+    expect(decide(base({ facts: withoutLiquid })).outcome).toBe('needs_review');
   });
 
   it('asks a human when a required state is missing', () => {

@@ -15,8 +15,11 @@ const optionalText = z
     return s === '' ? undefined : s;
   });
 
+// GHL ids are alphanumeric. They go into API URLs, so nothing else is accepted.
+const ghlId = z.string().trim().regex(/^[A-Za-z0-9_-]{1,64}$/, 'not a valid GHL id');
+
 export const LeadPayloadSchema = z.object({
-  contact_id: z.string().min(1),
+  contact_id: ghlId,
   first_name: optionalText,
   last_name: optionalText,
   residence_state: optionalText,
@@ -30,10 +33,31 @@ export const LeadPayloadSchema = z.object({
 
 export type LeadPayload = z.infer<typeof LeadPayloadSchema>;
 
-export function parsePayload(body: unknown): LeadPayload {
+const flatten = (body: unknown): Record<string, unknown> => {
   const raw = (body ?? {}) as Record<string, unknown>;
   const custom = (raw.customData ?? {}) as Record<string, unknown>;
-  return LeadPayloadSchema.parse({ ...raw, ...custom });
+  return { ...raw, ...custom };
+};
+
+export function parsePayload(body: unknown): LeadPayload {
+  return LeadPayloadSchema.parse(flatten(body));
+}
+
+// Sent by a second GHL workflow when an opportunity changes status or owner,
+// so the rep's seat can be given back or moved (see opportunity_changed).
+export const OpportunityPayloadSchema = z.object({
+  opportunity_id: ghlId,
+  status: z.string().trim().toLowerCase().pipe(z.enum(['open', 'won', 'lost', 'abandoned'])),
+  // GHL's opportunity merge fields expose the assigned user's id, not their
+  // e-mail; either works, the id is looked up in the CRM's user list.
+  assigned_to_email: optionalText,
+  assigned_to_user_id: optionalText,
+});
+
+export type OpportunityPayload = z.infer<typeof OpportunityPayloadSchema>;
+
+export function parseOpportunityPayload(body: unknown): OpportunityPayload {
+  return OpportunityPayloadSchema.parse(flatten(body));
 }
 
 // Same contact + same answers = same event. GHL retries and double submits are

@@ -29,6 +29,7 @@ export class GhlClient {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(20_000),
     });
 
     if (res.ok) return (res.status === 204 ? undefined : await res.json()) as T;
@@ -37,7 +38,8 @@ export class GhlClient {
     const retryable = res.status === 429 || res.status >= 500;
     if (retryable && attempt < 5) {
       const retryAfter = Number(res.headers.get('retry-after'));
-      const wait = retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 250 + Math.random() * 250;
+      // Capped so a run always ends well inside STALE_EVENT_MINUTES
+      const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 250 + Math.random() * 250, 30_000);
       await sleep(wait);
       return this.request<T>(method, path, body, attempt + 1);
     }
@@ -51,18 +53,23 @@ export class GhlClient {
     if (this.userCache && Date.now() - this.userCache.at < 10 * 60_000) return this.userCache.byEmail;
     const data = await this.request<{ users: { id: string; email: string }[] }>(
       'GET',
-      `/users/?locationId=${this.locationId}`,
+      `/users/?locationId=${encodeURIComponent(this.locationId)}`,
     );
     const byEmail = new Map(data.users.map((u) => [u.email.toLowerCase(), u.id]));
     this.userCache = { at: Date.now(), byEmail };
     return byEmail;
   }
 
+  async emailForUserId(userId: string): Promise<string | null> {
+    for (const [email, id] of await this.userIdsByEmail()) if (id === userId) return email;
+    return null;
+  }
+
   async pipeline(name: string): Promise<{ pipelineId: string; firstStageId: string }> {
     if (this.pipelineCache) return this.pipelineCache;
     const data = await this.request<{ pipelines: { id: string; name: string; stages: { id: string }[] }[] }>(
       'GET',
-      `/opportunities/pipelines?locationId=${this.locationId}`,
+      `/opportunities/pipelines?locationId=${encodeURIComponent(this.locationId)}`,
     );
     const pipeline = data.pipelines.find((p) => p.name === name);
     const firstStage = pipeline?.stages[0];
@@ -74,7 +81,7 @@ export class GhlClient {
   async customFieldIdsByKey(): Promise<Map<string, string>> {
     const data = await this.request<{ customFields: { id: string; fieldKey: string }[] }>(
       'GET',
-      `/locations/${this.locationId}/customFields`,
+      `/locations/${encodeURIComponent(this.locationId)}/customFields`,
     );
     return new Map(data.customFields.map((f) => [f.fieldKey, f.id]));
   }
@@ -82,19 +89,19 @@ export class GhlClient {
   // --- Writes ------------------------------------------------------------------
 
   assignContact(contactId: string, userId: string) {
-    return this.request('PUT', `/contacts/${contactId}`, { assignedTo: userId });
+    return this.request('PUT', `/contacts/${encodeURIComponent(contactId)}`, { assignedTo: userId });
   }
 
   addTags(contactId: string, tags: string[]) {
-    return this.request('POST', `/contacts/${contactId}/tags`, { tags });
+    return this.request('POST', `/contacts/${encodeURIComponent(contactId)}/tags`, { tags });
   }
 
   removeTags(contactId: string, tags: string[]) {
-    return this.request('DELETE', `/contacts/${contactId}/tags`, { tags });
+    return this.request('DELETE', `/contacts/${encodeURIComponent(contactId)}/tags`, { tags });
   }
 
   addNote(contactId: string, body: string) {
-    return this.request('POST', `/contacts/${contactId}/notes`, { body });
+    return this.request('POST', `/contacts/${encodeURIComponent(contactId)}/notes`, { body });
   }
 
   async createOpportunity(input: {

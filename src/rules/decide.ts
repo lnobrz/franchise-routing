@@ -84,16 +84,21 @@ export function decide(input: DecideInput): Decision {
 
   // 5. Financial qualification against the territory minimums.
   if (territory && territory.status === 'available') {
-    if (facts.liquidCapital === undefined && facts.netWorth === undefined) {
-      reasons.push('Financials not provided, cannot qualify for this territory');
+    // Both minimums apply, so both numbers are needed; a missing one is never assumed to pass.
+    const { liquidCapital, netWorth } = facts;
+    if (liquidCapital === undefined || netWorth === undefined) {
+      const missing = [liquidCapital === undefined && 'liquid capital', netWorth === undefined && 'net worth'];
+      reasons.push(
+        `Financials incomplete (${missing.filter(Boolean).join(' and ')} not provided or unreadable), cannot qualify for this territory`,
+      );
       return result('needs_review');
     }
     const short: string[] = [];
-    if (facts.liquidCapital !== undefined && facts.liquidCapital < territory.min_liquid_capital) {
-      short.push(`liquid capital ${usd(facts.liquidCapital)} below ${usd(territory.min_liquid_capital)} minimum`);
+    if (liquidCapital < territory.min_liquid_capital) {
+      short.push(`liquid capital ${usd(liquidCapital)} below ${usd(territory.min_liquid_capital)} minimum`);
     }
-    if (facts.netWorth !== undefined && facts.netWorth < territory.min_net_worth) {
-      short.push(`net worth ${usd(facts.netWorth)} below ${usd(territory.min_net_worth)} minimum`);
+    if (netWorth < territory.min_net_worth) {
+      short.push(`net worth ${usd(netWorth)} below ${usd(territory.min_net_worth)} minimum`);
     }
     if (short.length > 0) {
       reasons.push(`Not qualified for ${territory.code}: ${short.join('; ')}`);

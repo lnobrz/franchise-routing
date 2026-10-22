@@ -13,6 +13,12 @@ import type { LeadFacts, Outcome, RepRow } from './types.js';
 //   claim event -> read lead (AI + form) -> load context -> decide (pure)
 //   -> apply (reserve seat atomically, write CRM) -> explain and log
 //
+// Failure handling depends on whether the CRM was touched:
+//   - not yet: the claim and the seat are given back, GHL's retry starts clean
+//     (and if even that fails, the recovery job re-runs the stale claim)
+//   - already: never re-run automatically, which could assign the lead twice;
+//     the event and the contact are flagged for a person instead
+//
 // Nothing waits on another automation to finish saving a field. The webhook
 // carries the submitted answers, the decision is computed in memory from them,
 // and the CRM is written once at the end.
@@ -29,6 +35,10 @@ export type RouteResult = {
 type ReadLead = MergeResult & { ai: AiExtraction | null };
 type Applied = { outcome: Outcome; rep: RepRow | null; reasons: string[] };
 type Progress = { crmWritten: boolean };
+type Run = { eventKey: string; claimId: string; progress: Progress };
+
+/** The event was claimed again by another run (it looked stuck). Stop without writing. */
+export class ClaimLostError extends Error {}
 
 const TAGS: Record<Outcome, string> = {
   assigned: 'routing:assigned',
@@ -36,13 +46,15 @@ const TAGS: Record<Outcome, string> = {
   waiting_registration: 'routing:waiting-registration',
   needs_review: 'routing:needs-review',
 };
+export const NEEDS_ATTENTION_TAG = 'routing:needs-attention';
 
 export const createRouter = (deps: RouterDeps) =>
   async function routeLead(payload: LeadPayload, eventKey: string): Promise<RouteResult> {
     // Idempotency: a retried or doubled webhook stops here.
-    if (!(await deps.db.claimEvent(eventKey, payload.contact_id, payload))) return { status: 'duplicate' };
+    const claimId = await deps.db.claimEvent(eventKey, payload.contact_id, payload, deps.config.STALE_EVENT_MINUTES);
+    if (!claimId) return { status: 'duplicate' };
 
-    const progress: Progress = { crmWritten: false };
+    const run: Run = { eventKey, claimId, progress: { crmWritten: false } };
     try {
       const lead = await readLead(deps, payload);
       const now = new Date();
@@ -58,20 +70,53 @@ export const createRouter = (deps: RouterDeps) =>
       const where = decision.territoryCode ?? lead.facts.unitState ?? '';
       const applied =
         decision.outcome === 'assigned'
-          ? await assignToRep(deps, payload, decision, { now, where }, progress)
-          : await markUnassigned(deps, payload.contact_id, { ...decision, rep: null }, progress);
+          ? await assignToRep(deps, payload, decision, { now, where }, run)
+          : await markUnassigned(deps, payload.contact_id, { ...decision, rep: null }, run);
 
       await explainAndLog(deps, { payload, eventKey, lead, decision, applied });
+      await setStatus(deps.db, run, 'done');
 
       console.log(`[route] ${payload.contact_id} -> ${applied.outcome}${applied.rep ? ` (${applied.rep.full_name})` : ''}`);
       return { status: 'processed', outcome: applied.outcome, rep: applied.rep?.full_name, reasons: applied.reasons };
     } catch (error) {
-      // Nothing reached the CRM: free the event so GHL's retry can process it.
-      // Something did: keep the claim, so a retry can't double-assign.
-      if (!progress.crmWritten) await deps.db.unclaimEvent(eventKey);
+      if (!run.progress.crmWritten) {
+        // Nothing reached the CRM: free the event and its seat so GHL's retry
+        // can process it. If this fails too, the claim goes stale and the
+        // recovery job re-runs it.
+        await deps.db
+          .unclaimEvent(eventKey, claimId)
+          .catch((e: Error) => console.error(`[route] unclaim failed for ${eventKey}:`, e.message));
+      } else if (!(error instanceof ClaimLostError)) {
+        // Something did: keep the claim so a retry can't double-assign, and tell a person.
+        await flagForAttention(deps, eventKey, payload.contact_id, error as Error, claimId);
+      }
       throw error;
     }
   };
+
+/** Marks the event and the contact so a person checks what was written. Never throws. */
+export async function flagForAttention(
+  { db, ghl }: Pick<RouterDeps, 'db' | 'ghl'>,
+  eventKey: string,
+  contactId: string,
+  error: Error,
+  claimId?: string,
+): Promise<void> {
+  console.error(`[route] ${eventKey} needs attention:`, error.message);
+  await db
+    .setEventStatus(eventKey, 'needs_attention', claimId)
+    .catch((e: Error) => console.error(`[route] could not flag ${eventKey}:`, e.message));
+  await ghl
+    .addTags(contactId, [NEEDS_ATTENTION_TAG])
+    .catch((e: Error) => console.error(`[route] could not tag ${contactId}:`, e.message));
+  await ghl
+    .addNote(
+      contactId,
+      'Lead routing was interrupted after it started writing to the CRM, so it was not retried automatically. ' +
+        `Check this contact's owner, tags and opportunity by hand.\n\nEvent: ${eventKey}\nError: ${error.message}`,
+    )
+    .catch(() => undefined);
+}
 
 // --- Steps -----------------------------------------------------------------
 
@@ -92,13 +137,20 @@ async function loadContext(db: Db, facts: LeadFacts) {
   return { states, zip, territory, reps };
 }
 
+/** Moves the event to a new status, or stops if another run took it over. */
+async function setStatus(db: Db, run: Run, status: 'writing_crm' | 'done'): Promise<void> {
+  if (!(await db.setEventStatus(run.eventKey, status, run.claimId))) {
+    throw new ClaimLostError(`event ${run.eventKey} was claimed by another run`);
+  }
+}
+
 /** Takes a seat atomically, then writes the assignment to the CRM. */
 async function assignToRep(
   deps: RouterDeps,
   payload: LeadPayload,
   decision: Decision,
   { now, where }: { now: Date; where: string },
-  progress: Progress,
+  run: Run,
 ): Promise<Applied> {
   const { db, ghl, config } = deps;
   const reasons = [...decision.reasons];
@@ -110,50 +162,52 @@ async function assignToRep(
     if (!linked) reasons.push(`${rep.full_name} skipped: no CRM user with e-mail ${rep.email}`);
     return linked;
   });
+  const { pipelineId, firstStageId } = await ghl.pipeline(config.GHL_PIPELINE_NAME);
 
-  const chosenId = routable.length > 0 ? await db.reserveRep(routable.map((rep) => rep.id)) : null;
+  const chosenId = routable.length > 0 ? await db.reserveRep(routable.map((rep) => rep.id), run.eventKey) : null;
   const rep = routable.find((r) => r.id === chosenId);
 
   if (!rep) {
     reasons.push('Every eligible rep is at capacity, sent to the manager queue');
-    return markUnassigned(deps, payload.contact_id, { outcome: 'needs_review', rep: null, reasons }, progress);
+    return markUnassigned(deps, payload.contact_id, { outcome: 'needs_review', rep: null, reasons }, run);
   }
 
   reasons.push(describeRep(rep, decision.ownerRepId, now));
   const userId = userIds.get(rep.email.toLowerCase())!;
 
-  try {
-    const { pipelineId, firstStageId } = await ghl.pipeline(config.GHL_PIPELINE_NAME);
-    await ghl.assignContact(payload.contact_id, userId);
-    await ghl.addTags(payload.contact_id, [
-      TAGS.assigned,
-      ...(decision.territoryCode ? [`territory:${decision.territoryCode}`] : []),
-    ]);
-    await ghl.createOpportunity({
-      contactId: payload.contact_id,
-      name: opportunityName(payload, where),
-      pipelineId,
-      stageId: firstStageId,
-      assignedTo: userId,
-    });
-    progress.crmWritten = true;
-  } catch (error) {
-    await db.releaseRep(rep.id); // give the seat back before failing
-    throw error;
-  }
+  // The opportunity goes first: if it fails, nothing is in the CRM and the
+  // whole run can be retried. After it exists, the remaining writes only
+  // complete it, and a failure is flagged instead of retried with another rep.
+  await setStatus(db, run, 'writing_crm');
+  const opportunityId = await ghl.createOpportunity({
+    contactId: payload.contact_id,
+    name: opportunityName(payload, where),
+    pipelineId,
+    stageId: firstStageId,
+    assignedTo: userId,
+  });
+  run.progress.crmWritten = true;
+
+  await db.attachOpportunity(run.eventKey, opportunityId);
+  await ghl.assignContact(payload.contact_id, userId);
+  await ghl.addTags(payload.contact_id, [
+    TAGS.assigned,
+    ...(decision.territoryCode ? [`territory:${decision.territoryCode}`] : []),
+  ]);
 
   return { outcome: 'assigned', rep, reasons };
 }
 
 /** Blocked, waiting or needs review: tag the contact, no opportunity. */
 async function markUnassigned(
-  { ghl }: RouterDeps,
+  { db, ghl }: RouterDeps,
   contactId: string,
   applied: Applied,
-  progress: Progress,
+  run: Run,
 ): Promise<Applied> {
+  await setStatus(db, run, 'writing_crm');
   await ghl.addTags(contactId, [TAGS[applied.outcome]]);
-  progress.crmWritten = true;
+  run.progress.crmWritten = true;
   return applied;
 }
 
