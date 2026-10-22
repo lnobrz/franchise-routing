@@ -19,7 +19,11 @@ describe('payloads', () => {
       opportunity_id: 'opp1',
       status: 'won',
       assigned_to_email: undefined,
+      assigned_to_user_id: undefined,
     });
+    expect(
+      parseOpportunityPayload({ customData: { opportunity_id: 'opp1', status: 'open', assigned_to_user_id: 'u42' } }),
+    ).toMatchObject({ assigned_to_user_id: 'u42' });
     expect(() => parseOpportunityPayload({ opportunity_id: 'opp1', status: 'archived' })).toThrow();
   });
 });

@@ -163,18 +163,22 @@ body:
 If the webhook action can't set headers, the fields and a `webhook_secret` can go
 in its *Custom Data*; the server reads both shapes.
 
-A second workflow gives seats back. Trigger: *Opportunity Status Changed* and
-*Opportunity Changed* (assigned user), filtered to the routing pipeline. Action:
-*Webhook*, `POST` to `https://<your-domain>/webhooks/opportunity`, same secret header,
-body (pick the exact merge fields from the GHL picker; the names below are the usual ones):
+A second workflow gives seats back. Triggers, all filtered to the routing
+pipeline: *Opportunity Status Changed* moved to Won, to Lost and to Abandoned
+(one trigger each, GHL takes one status per trigger), and *Opportunity Changed*
+with *Assigned to* has changed. Action: *Webhook*, `POST` to
+`https://<your-domain>/webhooks/opportunity`, header `x-webhook-secret`, and
+this custom data:
 
-```json
-{
-  "opportunity_id": "{{opportunity.id}}",
-  "status": "{{opportunity.status}}",
-  "assigned_to_email": "{{user.email}}"
-}
-```
+| Key | Value |
+|---|---|
+| `opportunity_id` | `{{opportunity.id}}` |
+| `status` | `{{opportunity.status}}` |
+| `assigned_to_user_id` | Opportunity > Assigned To (ID) |
+
+GHL's opportunity fields give the assigned user's id, not their e-mail; the server
+looks the id up in the CRM's user list (`assigned_to_email` is accepted too).
+Keep *Allow re-entry* and *Allow multiple opportunities* on in the workflow settings.
 
 `status` is one of `open`, `won`, `lost`, `abandoned`. The call is idempotent, so
 repeated or overlapping triggers are harmless. Contacts tagged

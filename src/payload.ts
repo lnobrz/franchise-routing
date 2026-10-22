@@ -48,7 +48,10 @@ export function parsePayload(body: unknown): LeadPayload {
 export const OpportunityPayloadSchema = z.object({
   opportunity_id: ghlId,
   status: z.string().trim().toLowerCase().pipe(z.enum(['open', 'won', 'lost', 'abandoned'])),
+  // GHL's opportunity merge fields expose the assigned user's id, not their
+  // e-mail; either works, the id is looked up in the CRM's user list.
   assigned_to_email: optionalText,
+  assigned_to_user_id: optionalText,
 });
 
 export type OpportunityPayload = z.infer<typeof OpportunityPayloadSchema>;

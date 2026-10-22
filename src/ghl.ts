@@ -60,6 +60,11 @@ export class GhlClient {
     return byEmail;
   }
 
+  async emailForUserId(userId: string): Promise<string | null> {
+    for (const [email, id] of await this.userIdsByEmail()) if (id === userId) return email;
+    return null;
+  }
+
   async pipeline(name: string): Promise<{ pipelineId: string; firstStageId: string }> {
     if (this.pipelineCache) return this.pipelineCache;
     const data = await this.request<{ pipelines: { id: string; name: string; stages: { id: string }[] }[] }>(

@@ -69,7 +69,12 @@ app.post('/webhooks/opportunity', async (req, res) => {
 
   try {
     const change = parseOpportunityPayload(req.body);
-    const seat = await db.opportunityChanged(change.opportunity_id, change.status, change.assigned_to_email ?? null);
+    const assignedEmail =
+      change.assigned_to_email ??
+      (change.assigned_to_user_id ? await ghl.emailForUserId(change.assigned_to_user_id) : null) ??
+      // An id that isn't a CRM user (deleted, or a manager outside routing) frees the seat.
+      (change.assigned_to_user_id ? `unknown-user:${change.assigned_to_user_id}` : null);
+    const seat = await db.opportunityChanged(change.opportunity_id, change.status, assignedEmail);
     if (seat !== 'ignored' && seat !== 'unchanged') console.log(`[seat] ${change.opportunity_id} ${change.status} -> ${seat}`);
     res.json({ seat });
   } catch (error) {
