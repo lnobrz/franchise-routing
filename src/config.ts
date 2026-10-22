@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { z } from 'zod';
 
 // Node reads .env natively (no dotenv). Variables already set in the
-// environment, e.g. by pm2 or the host, take precedence.
+// environment, e.g. by the host, take precedence.
 if (existsSync('.env')) process.loadEnvFile('.env');
 
 export const isTimeZone = (timeZone: string): boolean => {
@@ -16,7 +16,7 @@ export const isTimeZone = (timeZone: string): boolean => {
 
 const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
-  // Only the reverse proxy on the same machine should reach the app
+  // 127.0.0.1 locally; 0.0.0.0 on Hostinger, whose proxy reaches the app from outside it
   HOST: z.string().default('127.0.0.1'),
 
   // Shared secret the GHL workflow sends in the x-webhook-secret header

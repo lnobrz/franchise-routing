@@ -206,23 +206,19 @@ tag added `routing:needs-attention`. Action: *Send internal notification* to the
 person who handles routing, redirecting to the contact. A smart list filtered on
 the same tag shows every lead waiting for a person.
 
-### Deploying on a managed Node host
+### Deploying (Hostinger)
 
-On a host that runs the app behind its own proxy (Hostinger, Render and the like),
-set `HOST=0.0.0.0`, leave `PORT` to the host, use `npm run build` as the build
-command and `dist/src/server.js` as the entry file, and run a single instance:
-the recovery and release jobs run inside the app.
+The app runs as a Hostinger Node.js web app, deployed from the `master` branch.
+Hostinger puts its own proxy and HTTPS in front of it and restarts it if it stops.
 
-### Deploying on a VPS
+- Build command `npm run build`, entry file `dist/src/server.js`.
+- Environment variables are those of `.env.example`, with `HOST=0.0.0.0`
+  (Hostinger's proxy reaches the app from outside it) and `PORT` left to Hostinger.
+- One instance only: the recovery and release jobs run inside the app.
+- After a deploy, `GET /health` answers `{"ok":true}`.
 
-```bash
-npm ci && npm run build
-pm2 start deploy/ecosystem.config.cjs
-# HTTPS: point a subdomain at the server and use deploy/Caddyfile
-```
-
-The app listens on `127.0.0.1` by default (`HOST`), so only Caddy on the same
-machine can reach it.
+`HOST` defaults to `127.0.0.1`, so a local `npm run dev` isn't reachable from the
+network.
 
 ## Testing
 
