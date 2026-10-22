@@ -47,8 +47,18 @@ describe('normalize', () => {
 
   it('restores the leading zero of New Jersey ZIPs', () => {
     expect(normalizeZip('7102')).toBe('07102');
+    expect(normalizeZip(7102)).toBe('07102');
     expect(normalizeZip('33130-1234')).toBe('33130');
+    expect(normalizeZip('331301234')).toBe('33130');
     expect(normalizeZip('123456')).toBeUndefined();
+  });
+
+  it('never turns a typo into a different ZIP', () => {
+    for (const typo of ['3313O', '33l30', '0', '1', '00000', '123', '33130-', '-33130', 'ZIP 33130', '7102-1234', '']) {
+      expect(normalizeZip(typo), typo).toBeUndefined();
+    }
+    expect(normalizeZip(0)).toBeUndefined();
+    expect(normalizeZip(1e10)).toBeUndefined();
   });
 
   it('parses money shorthand', () => {
@@ -66,6 +76,25 @@ describe('normalize', () => {
     expect(parseMoney('$1M+')).toBe(1_000_000);
     expect(parseMoney('Over $1M')).toBe(1_000_000);
     expect(parseMoney('500000 or more')).toBe(500_000);
+  });
+
+  it('reads European separators, and leaves ambiguous ones to a person', () => {
+    expect(parseMoney('1,5M')).toBe(1_500_000);
+    expect(parseMoney('2,75 million')).toBe(2_750_000);
+    expect(parseMoney('$1.000.000')).toBe(1_000_000);
+    expect(parseMoney('250.000,50')).toBe(250_000);
+    expect(parseMoney('250,000.00')).toBe(250_000);
+    expect(parseMoney('1,234,567')).toBe(1_234_567);
+    expect(parseMoney('250.000')).toBeUndefined(); // 250 or 250,000?
+    expect(parseMoney('1,5-2,5m')).toBe(1_500_000);
+    expect(parseMoney('0.3m')).toBe(300_000);
+    expect(parseMoney('2.3k')).toBe(2_300);
+    expect(parseMoney('8.2m')).toBe(8_200_000); // 8.2 * 1e6 = 8199999.999… in floating point
+  });
+
+  it('rejects negative, non-finite and absurd amounts', () => {
+    for (const junk of ['-5000', '1e9', 'NaN', 'Infinity', '9'.repeat(30)]) expect(parseMoney(junk), junk).toBeUndefined();
+    for (const junk of [-1, NaN, Infinity, 1e20]) expect(parseMoney(junk)).toBeUndefined();
   });
 
   it('leaves answers without a safe lower bound to a person', () => {
@@ -114,6 +143,14 @@ describe('legal check across two states', () => {
 });
 
 describe('rep ranking', () => {
+  it('survives a rep with a mistyped time zone: off shift, with a note', () => {
+    const reps = [rep('typo', { timezone: 'America/NewYork', open_leads: 0 }), rep('ok', { open_leads: 5 })];
+    const { candidates, notes } = rankCandidates({ reps, unitState: 'FL', ownerRepId: null, language: 'English', now: NOW });
+    expect(candidates.map((r) => r.id)).toEqual(['ok', 'typo']);
+    expect(notes[0]).toMatch(/typo: unknown time zone "America\/NewYork"/);
+    expect(isOnShift(reps[0]!, NOW)).toBe(false);
+  });
+
   it('puts the territory owner first, then reps on shift by lowest load', () => {
     const reps = [
       rep('busy', { open_leads: 6 }),
@@ -173,6 +210,13 @@ describe('merging the form with the AI read', () => {
   it('ignores the AI when its confidence is below the bar', () => {
     const r = mergeLead({ contact_id: 'c' }, ai({ unit_state: 'FL', confidence: 0.4 }), 0.7);
     expect(r.facts.unitState).toBeUndefined();
+  });
+
+  it('puts AI amounts through the same checks as the form', () => {
+    const r = mergeLead({ contact_id: 'c' }, ai({ liquid_capital_usd: -50, net_worth_usd: 1e20, zip: '123' }), 0.7);
+    expect(r.facts.liquidCapital).toBeUndefined();
+    expect(r.facts.netWorth).toBeUndefined();
+    expect(r.facts.zip).toBeUndefined();
   });
 
   it('flags a conflict instead of choosing when form and text disagree', () => {

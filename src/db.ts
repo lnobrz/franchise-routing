@@ -3,8 +3,15 @@ import type { Outcome, RepRow, StateRow, TerritoryRow, ZipRow } from './types.js
 import type { LeadPayload } from './payload.js';
 import type { AiExtraction } from './ai/extract.js';
 
-export type EventStatus = 'processing' | 'writing_crm' | 'done' | 'needs_attention';
-export type StaleEvent = { event_key: string; contact_id: string; payload: LeadPayload; status: EventStatus };
+export type EventStatus = 'processing' | 'writing_crm' | 'done' | 'failed' | 'needs_attention';
+export type StaleEvent = {
+  event_key: string;
+  contact_id: string;
+  payload: LeadPayload;
+  status: EventStatus;
+  attempts: number;
+  last_error: string | null;
+};
 export type SeatChange = 'released' | 'moved' | 'unchanged' | 'ignored';
 
 export class Db {
@@ -32,10 +39,13 @@ export class Db {
     return (data as string | null) ?? null;
   }
 
-  /** Lets a failed event be retried by GHL, and gives back the seat it took. */
-  async unclaimEvent(eventKey: string, claimId: string): Promise<void> {
-    const { error } = await this.sb.rpc('unclaim_event', { p_event_key: eventKey, p_claim_id: claimId });
-    if (error) throw new Error(`unclaimEvent: ${error.message}`);
+  /**
+   * The run failed before the CRM: gives back its seat and keeps the event as
+   * 'failed', so GHL's retry or the recovery job runs it again.
+   */
+  async failEvent(eventKey: string, claimId: string, reason: string): Promise<void> {
+    const { error } = await this.sb.rpc('fail_event', { p_event_key: eventKey, p_claim_id: claimId, p_error: reason });
+    if (error) throw new Error(`failEvent: ${error.message}`);
   }
 
   /** False when claimId no longer owns the event. Without claimId it always applies. */
@@ -69,13 +79,13 @@ export class Db {
     return (data?.payload as LeadPayload) ?? null;
   }
 
-  /** Events still processing or writing the CRM after staleMinutes. */
+  /** Events unfinished (processing, writing the CRM) or failed, untouched for staleMinutes. */
   async staleEvents(staleMinutes: number): Promise<StaleEvent[]> {
     const before = new Date(Date.now() - staleMinutes * 60_000).toISOString();
     const { data, error } = await this.sb
       .from('processed_events')
-      .select('event_key, contact_id, payload, status')
-      .in('status', ['processing', 'writing_crm'])
+      .select('event_key, contact_id, payload, status, attempts, last_error')
+      .in('status', ['processing', 'writing_crm', 'failed'])
       .lt('updated_at', before);
     if (error) throw new Error(`staleEvents: ${error.message}`);
     return (data ?? []) as StaleEvent[];
@@ -132,6 +142,18 @@ export class Db {
     return (data as string | null) ?? null;
   }
 
+  /** The rep currently holding a seat for this contact, if any. */
+  async openSeatRepForContact(contactId: string): Promise<string | null> {
+    const { data, error } = await this.sb
+      .from('rep_seats')
+      .select('rep_id')
+      .eq('contact_id', contactId)
+      .is('released_at', null)
+      .maybeSingle();
+    if (error) throw new Error(`openSeatRepForContact: ${error.message}`);
+    return data?.rep_id ?? null;
+  }
+
   /** Links the seat to its opportunity, so closing the opportunity frees the seat. */
   async attachOpportunity(eventKey: string, opportunityId: string): Promise<void> {
     const { error } = await this.sb
@@ -141,14 +163,27 @@ export class Db {
     if (error) throw new Error(`attachOpportunity: ${error.message}`);
   }
 
-  async opportunityChanged(opportunityId: string, status: string, assignedEmail: string | null): Promise<SeatChange> {
+  async opportunityChanged(
+    opportunityId: string,
+    status: string,
+    assignedEmail: string | null,
+    contactId: string | null,
+  ): Promise<SeatChange> {
     const { data, error } = await this.sb.rpc('opportunity_changed', {
       p_opportunity_id: opportunityId,
       p_status: status,
       p_assigned_email: assignedEmail,
+      p_contact_id: contactId,
     });
     if (error) throw new Error(`opportunity_changed: ${error.message}`);
     return data as SeatChange;
+  }
+
+  /** Clears payloads and AI reads older than retentionDays (PII). Returns events cleared. */
+  async purgeOldPayloads(retentionDays: number): Promise<number> {
+    const { data, error } = await this.sb.rpc('purge_old_payloads', { retention_days: retentionDays });
+    if (error) throw new Error(`purge_old_payloads: ${error.message}`);
+    return (data as number) ?? 0;
   }
 
   // --- Decision log --------------------------------------------------------

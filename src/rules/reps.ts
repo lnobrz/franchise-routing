@@ -10,14 +10,20 @@ export interface LocalTime {
   hhmm: string;       // "14:05"
 }
 
-export function localTime(now: Date, timeZone: string): LocalTime {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(now);
+/** null when the time zone is not a real one (a typo in the reps table). */
+export function localTime(now: Date, timeZone: string): LocalTime | null {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now);
+  } catch {
+    return null;
+  }
 
   const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
   const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -25,7 +31,9 @@ export function localTime(now: Date, timeZone: string): LocalTime {
 }
 
 export function isOnShift(rep: RepRow, now: Date): boolean {
-  const { isoWeekday, hhmm } = localTime(now, rep.timezone);
+  const local = localTime(now, rep.timezone);
+  if (!local) return false; // unknown time zone: never counted as on shift
+  const { isoWeekday, hhmm } = local;
   return (
     rep.work_days.includes(isoWeekday) &&
     hhmm >= rep.work_start.slice(0, 5) &&
@@ -57,6 +65,10 @@ export function rankCandidates({ reps, unitState, ownerRepId, language, now }: R
     return { candidates: [], notes };
   }
 
+  for (const r of pool) {
+    if (!localTime(now, r.timezone)) notes.push(`${r.full_name}: unknown time zone "${r.timezone}", treated as off shift`);
+  }
+
   if (language !== 'English') {
     const speakers = pool.filter((r) => r.languages.includes(language));
     if (speakers.length > 0) {
@@ -71,7 +83,7 @@ export function rankCandidates({ reps, unitState, ownerRepId, language, now }: R
     if (r.id === ownerRepId) return 0;     // territory owner keeps the relationship
     return isOnShift(r, now) ? 1 : 2;      // then whoever is working right now
   };
-  const load = (r: RepRow) => r.open_leads / r.max_open_leads;
+  const load = (r: RepRow) => (r.max_open_leads > 0 ? r.open_leads / r.max_open_leads : Infinity);
 
   const candidates = [...pool].sort(
     (a, b) => tier(a) - tier(b) || load(a) - load(b) || a.full_name.localeCompare(b.full_name),
@@ -83,9 +95,10 @@ export function rankCandidates({ reps, unitState, ownerRepId, language, now }: R
 export function describeRep(rep: RepRow, ownerRepId: string | null, now: Date): string {
   const parts: string[] = [];
   if (rep.id === ownerRepId) parts.push('territory owner');
-  const shift = isOnShift(rep, now);
-  const { hhmm } = localTime(now, rep.timezone);
-  parts.push(shift ? 'on shift' : `off shift (${hhmm} local), first contact next business morning`);
+  const local = localTime(now, rep.timezone);
+  if (!local) parts.push(`time zone "${rep.timezone}" unknown, shift not checked`);
+  else if (isOnShift(rep, now)) parts.push('on shift');
+  else parts.push(`off shift (${local.hhmm} local), first contact next business morning`);
   parts.push(`${rep.open_leads} of ${rep.max_open_leads} open leads before this one`);
   return `${rep.full_name}: ${parts.join(', ')}`;
 }

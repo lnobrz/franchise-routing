@@ -46,17 +46,26 @@ This version removes the problem instead of waiting it out:
 - **Atomic capacity.** `reserve_rep()` in `supabase/schema.sql` locks the candidate
   reps in Postgres and takes the seat in a single transaction. Two leads arriving
   at the same instant can't both see "7 of 8" and both take the last seat.
-- **Idempotent.** Each submission gets a key (contact id + hash of the answers).
-  A GHL retry or a double click is recognized and ignored.
+- **Idempotent.** Each submission gets a key (contact id + hash of the answers +
+  the day). A GHL retry or a double click is recognized and ignored; the same
+  answers sent on a later day are a new submission. A contact holds at most one
+  seat (a unique index), so a resubmitted form is never assigned twice.
 - **Safe failure.** Each event has a status (`processing`, `writing_crm`, `done`,
-  `needs_attention`) and a claim id. If something fails before the CRM is touched,
-  the claim and the seat are given back and GHL's retry starts clean. Once the
-  opportunity exists, a failure is never retried automatically (that could assign
-  the lead twice): the contact gets the `routing:needs-attention` tag and a note.
+  `failed`, `needs_attention`) and a claim id. If something fails before the CRM
+  is touched, the seat is given back and the event is kept as `failed`, with its
+  payload: nothing is deleted, so no lead can vanish. GHL's retry or the recovery
+  job runs it again; after `MAX_ROUTING_ATTEMPTS` the contact gets the
+  `routing:needs-attention` tag and a note with the error. Once the opportunity
+  exists (or may exist: a create that timed out or got a 5xx), a failure is never
+  retried automatically, which could create a second one: the contact is flagged
+  the same way. Creates are not retried on 5xx inside the GHL client either.
 - **Nothing lost on a restart.** Every `RELEASE_JOB_MINUTES` a recovery job looks
-  for events unfinished after `STALE_EVENT_MINUTES`. One that never reached the CRM
-  is routed again (its old claim and seat are taken over atomically); one that
-  stopped while writing the CRM is flagged for a person the same way.
+  for events unfinished or failed for `STALE_EVENT_MINUTES`. One that never reached
+  the CRM is routed again (its old claim and seat are taken over atomically); one
+  that stopped while writing the CRM is flagged for a person.
+- **Bad reference data can't stop routing.** The database rejects an unknown rep
+  time zone; if one gets through anyway, that rep is treated as off shift and the
+  decision note says why. `BUSINESS_TIMEZONE` is validated at startup.
 - **Seats come back.** Each seat is recorded in `rep_seats` with its opportunity.
   When the opportunity is won, lost or abandoned the seat is freed; when it is
   reassigned the seat moves to the new rep. Without this, every rep would end up
@@ -85,6 +94,13 @@ human review.
 minimums; if either is missing or unreadable, the lead goes to a human. Dropdown
 answers are read conservatively: a range like "$100,000 - $250,000" counts as its
 lower bound, "$1M+" as $1M, and "Under $50k" (no lower bound) as unreadable.
+European separators are understood ("1,5M", "1.000.000"); an ambiguous "250.000"
+is unreadable. Negative or absurd amounts, from the form or the AI, are ignored.
+A lead with no territory (no ZIP, or a ZIP outside the map) has no minimums to
+check.
+
+**ZIP.** Typos are never turned into another ZIP: "3313O" is unreadable, while a
+ZIP saved as a number that lost its leading zero ("7102") becomes "07102".
 
 **Rep ranking (`src/rules/reps.ts`).** Active reps covering the unit state, then:
 language match (falls back to English if nobody speaks it), territory owner first,
@@ -127,10 +143,10 @@ go to Carlos last week?" is one query.
 ## Setup
 
 1. **Supabase:** run `supabase/schema.sql`, then `supabase/seed.sql` in the SQL editor.
-   A database created with an earlier version only needs
-   `supabase/migrations/001_seats_and_event_status.sql`; afterwards set each rep's
-   `open_leads` to their real number of open leads, since seats taken before the
-   migration aren't linked to an opportunity.
+   A database created with an earlier version only needs the files in
+   `supabase/migrations/`, in order. After `001`, set each rep's `open_leads` to
+   their real number of open leads, since seats taken before it aren't linked to
+   an opportunity.
 2. **GoHighLevel:** custom fields, the inquiry form, a pipeline, and users whose
    e-mails match the `reps` table. Create a Private Integration token with
    contacts, opportunities, users and custom fields scopes.
@@ -175,6 +191,7 @@ this custom data:
 | `opportunity_id` | `{{opportunity.id}}` |
 | `status` | `{{opportunity.status}}` |
 | `assigned_to_user_id` | Opportunity > Assigned To (ID) |
+| `contact_id` | `{{contact.id}}` (finds the seat if its opportunity id was never recorded) |
 
 GHL's opportunity fields give the assigned user's id, not their e-mail; the server
 looks the id up in the CRM's user list (`assigned_to_email` is accepted too).

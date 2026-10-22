@@ -5,6 +5,15 @@ import { z } from 'zod';
 // environment, e.g. by pm2 or the host, take precedence.
 if (existsSync('.env')) process.loadEnvFile('.env');
 
+export const isTimeZone = (timeZone: string): boolean => {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   // Only the reverse proxy on the same machine should reach the app
@@ -27,10 +36,14 @@ const EnvSchema = z.object({
   AI_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.7),
 
   // Time zone used for "today" in the registration expiry check
-  BUSINESS_TIMEZONE: z.string().default('America/New_York'),
+  BUSINESS_TIMEZONE: z.string().default('America/New_York').refine(isTimeZone, 'not a known IANA time zone'),
   RELEASE_JOB_MINUTES: z.coerce.number().int().positive().default(15),
   // An event still unfinished after this long is treated as interrupted
   STALE_EVENT_MINUTES: z.coerce.number().int().positive().default(10),
+  // A lead that keeps failing before the CRM is retried this many times, then flagged
+  MAX_ROUTING_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  // Payloads and AI reads (personal data) older than this are cleared
+  PII_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
 });
 
 export type Config = z.infer<typeof EnvSchema>;

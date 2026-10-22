@@ -4,7 +4,7 @@ import { mergeLead, type MergeResult } from './rules/merge.js';
 import { describeRep } from './rules/reps.js';
 import type { AiExtraction, Extractor } from './ai/extract.js';
 import type { Db } from './db.js';
-import type { GhlClient } from './ghl.js';
+import { GhlError, type GhlClient } from './ghl.js';
 import type { LeadPayload } from './payload.js';
 import type { LeadFacts, Outcome, RepRow } from './types.js';
 
@@ -14,10 +14,11 @@ import type { LeadFacts, Outcome, RepRow } from './types.js';
 //   -> apply (reserve seat atomically, write CRM) -> explain and log
 //
 // Failure handling depends on whether the CRM was touched:
-//   - not yet: the claim and the seat are given back, GHL's retry starts clean
-//     (and if even that fails, the recovery job re-runs the stale claim)
-//   - already: never re-run automatically, which could assign the lead twice;
-//     the event and the contact are flagged for a person instead
+//   - not yet: the seat is given back and the event is kept as 'failed', with
+//     its payload; GHL's retry or the recovery job runs it again, and after too
+//     many attempts a person is told. Nothing is deleted, so no lead vanishes.
+//   - already (or maybe: a create that timed out): never re-run automatically,
+//     which could assign the lead twice; the contact is flagged for a person
 //
 // Nothing waits on another automation to finish saving a field. The webhook
 // carries the submitted answers, the decision is computed in memory from them,
@@ -79,30 +80,36 @@ export const createRouter = (deps: RouterDeps) =>
       console.log(`[route] ${payload.contact_id} -> ${applied.outcome}${applied.rep ? ` (${applied.rep.full_name})` : ''}`);
       return { status: 'processed', outcome: applied.outcome, rep: applied.rep?.full_name, reasons: applied.reasons };
     } catch (error) {
+      if (error instanceof ClaimLostError) throw error;
       if (!run.progress.crmWritten) {
-        // Nothing reached the CRM: free the event and its seat so GHL's retry
-        // can process it. If this fails too, the claim goes stale and the
-        // recovery job re-runs it.
+        // Nothing reached the CRM: give the seat back and keep the event as
+        // 'failed'. If even that fails, the claim goes stale and the recovery
+        // job picks it up.
         await deps.db
-          .unclaimEvent(eventKey, claimId)
-          .catch((e: Error) => console.error(`[route] unclaim failed for ${eventKey}:`, e.message));
-      } else if (!(error instanceof ClaimLostError)) {
+          .failEvent(eventKey, claimId, (error as Error).message)
+          .catch((e: Error) => console.error(`[route] could not mark ${eventKey} failed:`, e.message));
+      } else {
         // Something did: keep the claim so a retry can't double-assign, and tell a person.
-        await flagForAttention(deps, eventKey, payload.contact_id, error as Error, claimId);
+        await flagForAttention(deps, eventKey, payload.contact_id, (error as Error).message, CRM_INTERRUPTED, claimId);
       }
       throw error;
     }
   };
 
-/** Marks the event and the contact so a person checks what was written. Never throws. */
+export const CRM_INTERRUPTED =
+  'Lead routing was interrupted after it started writing to the CRM, so it was not retried automatically. ' +
+  "Check this contact's owner, tags and opportunity by hand.";
+
+/** Marks the event and the contact so a person looks at it. Never throws. */
 export async function flagForAttention(
   { db, ghl }: Pick<RouterDeps, 'db' | 'ghl'>,
   eventKey: string,
   contactId: string,
-  error: Error,
+  error: string,
+  explanation: string,
   claimId?: string,
 ): Promise<void> {
-  console.error(`[route] ${eventKey} needs attention:`, error.message);
+  console.error(`[route] ${eventKey} needs attention:`, error);
   await db
     .setEventStatus(eventKey, 'needs_attention', claimId)
     .catch((e: Error) => console.error(`[route] could not flag ${eventKey}:`, e.message));
@@ -110,13 +117,13 @@ export async function flagForAttention(
     .addTags(contactId, [NEEDS_ATTENTION_TAG])
     .catch((e: Error) => console.error(`[route] could not tag ${contactId}:`, e.message));
   await ghl
-    .addNote(
-      contactId,
-      'Lead routing was interrupted after it started writing to the CRM, so it was not retried automatically. ' +
-        `Check this contact's owner, tags and opportunity by hand.\n\nEvent: ${eventKey}\nError: ${error.message}`,
-    )
+    .addNote(contactId, `${explanation}\n\nEvent: ${eventKey}\nError: ${error}`)
     .catch(() => undefined);
 }
+
+/** A 4xx answer means GHL refused the request; anything else may have been applied. */
+const definitelyRejected = (error: unknown): boolean =>
+  error instanceof GhlError && error.status >= 400 && error.status < 500 && error.status !== 429;
 
 // --- Steps -----------------------------------------------------------------
 
@@ -164,6 +171,14 @@ async function assignToRep(
   });
   const { pipelineId, firstStageId } = await ghl.pipeline(config.GHL_PIPELINE_NAME);
 
+  // A contact already holding a seat (a resubmitted form) is not assigned twice.
+  const holder = await db.openSeatRepForContact(payload.contact_id);
+  if (holder) {
+    const holderName = decision.candidates.find((r) => r.id === holder)?.full_name ?? 'another rep';
+    reasons.push(`Contact already has an open assignment (${holderName}); not assigned again`);
+    return markUnassigned(deps, payload.contact_id, { outcome: 'needs_review', rep: null, reasons }, run);
+  }
+
   const chosenId = routable.length > 0 ? await db.reserveRep(routable.map((rep) => rep.id), run.eventKey) : null;
   const rep = routable.find((r) => r.id === chosenId);
 
@@ -179,16 +194,31 @@ async function assignToRep(
   // whole run can be retried. After it exists, the remaining writes only
   // complete it, and a failure is flagged instead of retried with another rep.
   await setStatus(db, run, 'writing_crm');
-  const opportunityId = await ghl.createOpportunity({
-    contactId: payload.contact_id,
-    name: opportunityName(payload, where),
-    pipelineId,
-    stageId: firstStageId,
-    assignedTo: userId,
-  });
+  let opportunityId: string;
+  try {
+    opportunityId = await ghl.createOpportunity({
+      contactId: payload.contact_id,
+      name: opportunityName(payload, where),
+      pipelineId,
+      stageId: firstStageId,
+      assignedTo: userId,
+    });
+  } catch (error) {
+    // A timeout or 5xx may still have created it: treat as written, so a
+    // person checks instead of a retry creating a second one.
+    if (!definitelyRejected(error)) run.progress.crmWritten = true;
+    throw error;
+  }
   run.progress.crmWritten = true;
 
-  await db.attachOpportunity(run.eventKey, opportunityId);
+  // One retry; if it still fails, the error names the opportunity so a person
+  // can link it (or the opportunity webhook finds the seat by contact).
+  await db
+    .attachOpportunity(run.eventKey, opportunityId)
+    .catch(() => db.attachOpportunity(run.eventKey, opportunityId))
+    .catch((error: Error) => {
+      throw new Error(`opportunity ${opportunityId} created but not linked to its seat: ${error.message}`);
+    });
   await ghl.assignContact(payload.contact_id, userId);
   await ghl.addTags(payload.contact_id, [
     TAGS.assigned,

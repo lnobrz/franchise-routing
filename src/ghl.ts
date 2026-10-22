@@ -18,8 +18,18 @@ export class GhlClient {
 
   constructor(private token: string, readonly locationId: string) {}
 
-  /** Retries rate limits (429) and server errors with exponential backoff. */
-  private async request<T>(method: string, path: string, body?: unknown, attempt = 1): Promise<T> {
+  /**
+   * Retries rate limits (429) with backoff, and server errors (5xx) too except
+   * on a POST that creates something: it may have been created before the
+   * error, and repeating it would create it twice.
+   */
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    { idempotent = method !== 'POST' }: { idempotent?: boolean } = {},
+    attempt = 1,
+  ): Promise<T> {
     const res = await fetch(`${BASE_URL}${path}`, {
       method,
       headers: {
@@ -35,13 +45,13 @@ export class GhlClient {
     if (res.ok) return (res.status === 204 ? undefined : await res.json()) as T;
 
     const text = await res.text();
-    const retryable = res.status === 429 || res.status >= 500;
+    const retryable = res.status === 429 || (res.status >= 500 && idempotent);
     if (retryable && attempt < 5) {
       const retryAfter = Number(res.headers.get('retry-after'));
       // Capped so a run always ends well inside STALE_EVENT_MINUTES
       const wait = Math.min(retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 250 + Math.random() * 250, 30_000);
       await sleep(wait);
-      return this.request<T>(method, path, body, attempt + 1);
+      return this.request<T>(method, path, body, { idempotent }, attempt + 1);
     }
     throw new GhlError(`GHL ${method} ${path} failed with ${res.status}`, res.status, text);
   }
@@ -60,9 +70,13 @@ export class GhlClient {
     return byEmail;
   }
 
+  /** Looks the user up in the cached list; a miss refreshes it once (a user added a moment ago). */
   async emailForUserId(userId: string): Promise<string | null> {
-    for (const [email, id] of await this.userIdsByEmail()) if (id === userId) return email;
-    return null;
+    const find = (users: Map<string, string>) => [...users].find(([, id]) => id === userId)?.[0] ?? null;
+    const cached = find(await this.userIdsByEmail());
+    if (cached) return cached;
+    this.userCache = null;
+    return find(await this.userIdsByEmail());
   }
 
   async pipeline(name: string): Promise<{ pipelineId: string; firstStageId: string }> {
@@ -93,7 +107,8 @@ export class GhlClient {
   }
 
   addTags(contactId: string, tags: string[]) {
-    return this.request('POST', `/contacts/${encodeURIComponent(contactId)}/tags`, { tags });
+    // Adding a tag twice is harmless, so this POST can be retried
+    return this.request('POST', `/contacts/${encodeURIComponent(contactId)}/tags`, { tags }, { idempotent: true });
   }
 
   removeTags(contactId: string, tags: string[]) {

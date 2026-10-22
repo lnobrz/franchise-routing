@@ -47,6 +47,8 @@ export function parsePayload(body: unknown): LeadPayload {
 // so the rep's seat can be given back or moved (see opportunity_changed).
 export const OpportunityPayloadSchema = z.object({
   opportunity_id: ghlId,
+  // Lets the seat be found when the opportunity id was never recorded
+  contact_id: ghlId.optional().or(z.literal('').transform(() => undefined)),
   status: z.string().trim().toLowerCase().pipe(z.enum(['open', 'won', 'lost', 'abandoned'])),
   // GHL's opportunity merge fields expose the assigned user's id, not their
   // e-mail; either works, the id is looked up in the CRM's user list.
@@ -60,11 +62,13 @@ export function parseOpportunityPayload(body: unknown): OpportunityPayload {
   return OpportunityPayloadSchema.parse(flatten(body));
 }
 
-// Same contact + same answers = same event. GHL retries and double submits are
-// recognized; a lead who comes back later with different answers is a new event.
-export function eventKeyFor(payload: LeadPayload): string {
+// Same contact + same answers on the same day = same event. GHL retries and
+// double submits are recognized; the same answers sent again on a later day
+// (a blocked lead coming back once a state is registered) are a new event.
+// A retry that crosses midnight can't assign twice: a contact holds one seat.
+export function eventKeyFor(payload: LeadPayload, now = new Date()): string {
   const { contact_id, ...answers } = payload;
   const canonical = JSON.stringify(answers, Object.keys(answers).sort());
   const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
-  return `${contact_id}:${hash}`;
+  return `${contact_id}:${hash}:${now.toISOString().slice(0, 10)}`;
 }

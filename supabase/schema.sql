@@ -92,6 +92,20 @@ create table reps (
 create trigger reps_updated_at before update on reps
   for each row execute function set_updated_at();
 
+-- A typo like "America/NewYork" would make every lead for this rep fail.
+create or replace function check_rep_timezone() returns trigger
+language plpgsql as $$
+begin
+  if not exists (select 1 from pg_timezone_names where name = new.timezone) then
+    raise exception 'Unknown time zone "%". Use an IANA name such as America/New_York.', new.timezone;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger reps_timezone_valid before insert or update of timezone on reps
+  for each row execute function check_rep_timezone();
+
 -- ---------------------------------------------------------------------------
 -- Territories and the ZIP codes they cover
 -- ---------------------------------------------------------------------------
@@ -130,16 +144,19 @@ create table processed_events (
   -- processing:      claimed, nothing sent to the CRM yet (safe to run again)
   -- writing_crm:     the CRM is being written (never re-run automatically)
   -- done:            decision logged
-  -- needs_attention: failed after touching the CRM, a person has to look
+  -- failed:          failed before the CRM; GHL's retry or the recovery job runs it again
+  -- needs_attention: failed after touching the CRM, or failed too often; a person has to look
   status      text not null default 'processing'
-              check (status in ('processing', 'writing_crm', 'done', 'needs_attention')),
+              check (status in ('processing', 'writing_crm', 'done', 'failed', 'needs_attention')),
   claim_id    uuid not null default gen_random_uuid(),  -- which run owns the event
+  attempts    integer not null default 0,               -- failed runs so far
+  last_error  text,
   received_at timestamptz not null default now(),
   updated_at  timestamptz not null default now()
 );
 
 create index processed_events_open_idx on processed_events (updated_at)
-  where status in ('processing', 'writing_crm');
+  where status in ('processing', 'writing_crm', 'failed');
 
 -- ---------------------------------------------------------------------------
 -- Decision log: why every lead went where it went
@@ -174,6 +191,7 @@ create index routing_decisions_waiting_idx on routing_decisions (outcome)
 
 create table rep_seats (
   event_key      text primary key references processed_events(event_key),
+  contact_id     text not null,
   rep_id         uuid not null references reps(id),
   opportunity_id text unique,          -- set once the opportunity exists in the CRM
   taken_at       timestamptz not null default now(),
@@ -181,14 +199,17 @@ create table rep_seats (
 );
 
 create index rep_seats_rep_idx on rep_seats (rep_id) where released_at is null;
+-- A contact holds at most one seat: a resubmitted form can't be assigned twice.
+create unique index rep_seats_one_open_per_contact on rep_seats (contact_id) where released_at is null;
 
 -- ---------------------------------------------------------------------------
 -- Event claims
 --
 -- claim_event() returns a claim id, or null when the event is already taken.
--- An event stuck in 'processing' (the server died before writing to the CRM)
--- can be claimed again once it is older than stale_seconds; its seat, if it
--- took one, is given back first. Every later status change must present the
+-- A 'failed' event (it failed before the CRM) can be claimed again at once,
+-- and one stuck in 'processing' (the server died before writing to the CRM)
+-- once it is older than stale_seconds; its seat, if it took one, is given
+-- back first. Every later status change must present the
 -- claim id, so a run that lost its claim can't write over the new one.
 -- ---------------------------------------------------------------------------
 
@@ -223,10 +244,10 @@ begin
   end if;
 
   update processed_events
-    set claim_id = gen_random_uuid(), updated_at = now()
+    set claim_id = gen_random_uuid(), status = 'processing', updated_at = now()
     where event_key = p_event_key
-      and status = 'processing'
-      and updated_at < now() - make_interval(secs => stale_seconds)
+      and (status = 'failed'
+           or (status = 'processing' and updated_at < now() - make_interval(secs => stale_seconds)))
     returning claim_id into claimed;
   if claimed is not null then
     perform release_event_seat(p_event_key);
@@ -236,20 +257,26 @@ begin
 end;
 $$;
 
--- Lets GHL's retry process an event that failed before reaching the CRM.
-create or replace function unclaim_event(p_event_key text, p_claim_id uuid)
+-- An event that failed before reaching the CRM: its seat is given back and it
+-- is kept as 'failed' (with its payload), so GHL's retry or the recovery job
+-- can run it again. Nothing is deleted, so a lead can't vanish.
+create or replace function fail_event(p_event_key text, p_claim_id uuid, p_error text)
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
 begin
+  -- 'writing_crm' too: the app only calls this when it knows nothing was
+  -- written (e.g. GHL refused the very first write).
   perform 1 from processed_events
-    where event_key = p_event_key and claim_id = p_claim_id and status <> 'done'
+    where event_key = p_event_key and claim_id = p_claim_id and status in ('processing', 'writing_crm')
     for update;
   if found then
     perform release_event_seat(p_event_key);
-    delete from processed_events where event_key = p_event_key;
+    update processed_events
+      set status = 'failed', attempts = attempts + 1, last_error = left(p_error, 500), updated_at = now()
+      where event_key = p_event_key;
   end if;
 end;
 $$;
@@ -302,7 +329,8 @@ begin
 
   if chosen is not null then
     update reps set open_leads = open_leads + 1 where id = chosen;
-    insert into rep_seats (event_key, rep_id) values (p_event_key, chosen);
+    insert into rep_seats (event_key, contact_id, rep_id)
+      select p_event_key, contact_id, chosen from processed_events where event_key = p_event_key;
   end if;
 
   return chosen;
@@ -318,9 +346,13 @@ $$;
 --
 -- Returns what happened: released, moved, unchanged or ignored (unknown
 -- opportunity, or its seat was already given back). Safe to call repeatedly.
+-- If the opportunity id was never recorded (the run stopped right after
+-- creating it), the contact's open seat without an opportunity is used.
 -- ---------------------------------------------------------------------------
 
-create or replace function opportunity_changed(p_opportunity_id text, p_status text, p_assigned_email text)
+create or replace function opportunity_changed(
+  p_opportunity_id text, p_status text, p_assigned_email text, p_contact_id text default null
+)
 returns text
 language plpgsql
 security definer
@@ -331,6 +363,14 @@ declare
   new_rep uuid;
 begin
   select * into seat from rep_seats where opportunity_id = p_opportunity_id for update;
+  if not found and coalesce(p_contact_id, '') <> '' then
+    select * into seat from rep_seats
+      where contact_id = p_contact_id and opportunity_id is null and released_at is null
+      for update;
+    if found then
+      update rep_seats set opportunity_id = p_opportunity_id where event_key = seat.event_key;
+    end if;
+  end if;
   if not found or seat.released_at is not null then
     return 'ignored';
   end if;
@@ -366,6 +406,35 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- PII retention: payloads and AI reads older than retention_days are cleared.
+-- Payloads still needed (waiting leads, unfinished events) are kept.
+-- ---------------------------------------------------------------------------
+
+create or replace function purge_old_payloads(retention_days integer)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  cleared integer;
+begin
+  update processed_events e set payload = '{}'::jsonb
+    where e.status in ('done', 'needs_attention')
+      and e.updated_at < now() - make_interval(days => retention_days)
+      and e.payload <> '{}'::jsonb
+      and not exists (
+        select 1 from routing_decisions d
+        where d.event_key = e.event_key and d.outcome = 'waiting_registration' and d.resolved_at is null
+      );
+  get diagnostics cleared = row_count;
+  update routing_decisions set ai_extraction = null
+    where ai_extraction is not null and created_at < now() - make_interval(days => retention_days);
+  return cleared;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Lock everything down to the server
 -- ---------------------------------------------------------------------------
 
@@ -379,13 +448,15 @@ alter table rep_seats         enable row level security;
 
 revoke execute on function release_event_seat(text)                  from public, anon, authenticated;
 revoke execute on function claim_event(text, text, jsonb, integer)   from public, anon, authenticated;
-revoke execute on function unclaim_event(text, uuid)                 from public, anon, authenticated;
+revoke execute on function fail_event(text, uuid, text)              from public, anon, authenticated;
 revoke execute on function set_event_status(text, text, uuid)        from public, anon, authenticated;
 revoke execute on function reserve_rep(uuid[], text)                 from public, anon, authenticated;
-revoke execute on function opportunity_changed(text, text, text)     from public, anon, authenticated;
+revoke execute on function opportunity_changed(text, text, text, text) from public, anon, authenticated;
+revoke execute on function purge_old_payloads(integer)                from public, anon, authenticated;
 grant  execute on function release_event_seat(text)                  to service_role;
 grant  execute on function claim_event(text, text, jsonb, integer)   to service_role;
-grant  execute on function unclaim_event(text, uuid)                 to service_role;
+grant  execute on function fail_event(text, uuid, text)              to service_role;
 grant  execute on function set_event_status(text, text, uuid)        to service_role;
 grant  execute on function reserve_rep(uuid[], text)                 to service_role;
-grant  execute on function opportunity_changed(text, text, text)     to service_role;
+grant  execute on function opportunity_changed(text, text, text, text) to service_role;
+grant  execute on function purge_old_payloads(integer)                to service_role;

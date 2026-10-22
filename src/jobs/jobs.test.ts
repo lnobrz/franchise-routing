@@ -6,7 +6,7 @@ import type { Db } from '../db.js';
 import type { GhlClient } from '../ghl.js';
 import type { StateRow } from '../types.js';
 
-const config = { BUSINESS_TIMEZONE: 'America/New_York', STALE_EVENT_MINUTES: 10 } as Config;
+const config = { BUSINESS_TIMEZONE: 'America/New_York', STALE_EVENT_MINUTES: 10, MAX_ROUTING_ATTEMPTS: 5 } as Config;
 const open = (code: string): StateRow => ({
   code,
   name: code,
@@ -72,9 +72,12 @@ describe('releaseWaiting', () => {
 });
 
 describe('recoverStuck', () => {
-  const dbMock = (events: { event_key: string; contact_id: string; status: string }[], hasDecision = false) =>
+  type Ev = { event_key: string; contact_id: string; status: string; attempts?: number; last_error?: string };
+  const dbMock = (events: Ev[], hasDecision = false) =>
     ({
-      staleEvents: vi.fn().mockResolvedValue(events.map((e) => ({ ...e, payload: { contact_id: e.contact_id } }))),
+      staleEvents: vi
+        .fn()
+        .mockResolvedValue(events.map((e) => ({ attempts: 0, last_error: null, ...e, payload: { contact_id: e.contact_id } }))),
       hasDecision: vi.fn().mockResolvedValue(hasDecision),
       setEventStatus: vi.fn().mockResolvedValue(true),
     }) as unknown as Db & Record<string, ReturnType<typeof vi.fn>>;
@@ -84,6 +87,24 @@ describe('recoverStuck', () => {
     const routeLead = vi.fn().mockResolvedValue({ status: 'processed', outcome: 'assigned' });
     await recoverStuck({ db, ghl: ghlMock(), config, routeLead });
     expect(routeLead).toHaveBeenCalledWith({ contact_id: 'c1' }, 'c1:aaa');
+  });
+
+  it('retries an event that failed before the CRM', async () => {
+    const db = dbMock([{ event_key: 'c1:aaa', contact_id: 'c1', status: 'failed', attempts: 2, last_error: 'pipeline not found' }]);
+    const routeLead = vi.fn().mockResolvedValue({ status: 'processed', outcome: 'assigned' });
+    await recoverStuck({ db, ghl: ghlMock(), config, routeLead });
+    expect(routeLead).toHaveBeenCalledWith({ contact_id: 'c1' }, 'c1:aaa');
+  });
+
+  it('gives up after MAX_ROUTING_ATTEMPTS and tells a person, with the last error', async () => {
+    const db = dbMock([{ event_key: 'c1:aaa', contact_id: 'c1', status: 'failed', attempts: 5, last_error: 'pipeline not found' }]);
+    const ghl = ghlMock();
+    const routeLead = vi.fn();
+    await recoverStuck({ db, ghl, config, routeLead });
+    expect(routeLead).not.toHaveBeenCalled();
+    expect(db.setEventStatus).toHaveBeenCalledWith('c1:aaa', 'needs_attention', undefined);
+    expect(ghl.addTags).toHaveBeenCalledWith('c1', ['routing:needs-attention']);
+    expect(ghl.addNote).toHaveBeenCalledWith('c1', expect.stringMatching(/failed several times[\s\S]*pipeline not found/));
   });
 
   it('marks done an event whose decision was logged', async () => {

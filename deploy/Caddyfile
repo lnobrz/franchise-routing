@@ -1,5 +1,5 @@
 # Replace with the subdomain pointed at the VPS. Caddy gets the HTTPS
 # certificate automatically.
 routing.example.com {
-	reverse_proxy localhost:3000
+	reverse_proxy 127.0.0.1:3000
 }
