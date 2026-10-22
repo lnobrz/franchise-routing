@@ -197,9 +197,21 @@ GHL's opportunity fields give the assigned user's id, not their e-mail; the serv
 looks the id up in the CRM's user list (`assigned_to_email` is accepted too).
 Keep *Allow re-entry* and *Allow multiple opportunities* on in the workflow settings.
 
-`status` is one of `open`, `won`, `lost`, `abandoned`. The call is idempotent, so
-repeated or overlapping triggers are harmless. Contacts tagged
-`routing:needs-attention` are worth a smart list or a notification in GHL.
+`status` is one of `open`, `won`, `lost`, `abandoned` (GHL's "Abandon" is accepted
+too). The call is idempotent, so repeated or overlapping triggers are harmless.
+GHL queues these workflows, so a seat can take a few minutes to come back.
+
+A third workflow tells a person when a lead needs one. Trigger: *Contact Tag*,
+tag added `routing:needs-attention`. Action: *Send internal notification* to the
+person who handles routing, redirecting to the contact. A smart list filtered on
+the same tag shows every lead waiting for a person.
+
+### Deploying on a managed Node host
+
+On a host that runs the app behind its own proxy (Hostinger, Render and the like),
+set `HOST=0.0.0.0`, leave `PORT` to the host, use `npm run build` as the build
+command and `dist/src/server.js` as the entry file, and run a single instance:
+the recovery and release jobs run inside the app.
 
 ### Deploying on a VPS
 
@@ -215,14 +227,27 @@ machine can reach it.
 ## Testing
 
 ```bash
-npm test              # rules and orchestration (no network)
-npm run simulate      # creates test contacts in GHL and fires real webhooks
-npm run simulate -- race
+npm test                    # rules and orchestration (no network)
+npm run simulate            # creates test contacts in GHL and fires real webhooks
+npm run simulate -- zip-typo  # one scenario by name
 ```
 
-The simulator covers: the AI filling gaps from a Spanish free-text answer, a lead
-touching two states where one has a pending renewal, a sold-out state, a
-form/text contradiction, and two leads racing for a rep's last seat.
+The simulator checks every outcome and exits with 1 if any scenario routes
+differently than expected, so it can run before each deploy. It gives back the
+seats it took. Its expectations match `supabase/seed.sql`. Scenarios:
+
+| Scenario | Expected |
+|---|---|
+| AI fills state, ZIP and language from a Spanish answer | assigned to the Spanish-speaking territory owner |
+| Unit in a state with a pending renewal | waiting |
+| State with no units left; residence in a never-registered state | blocked |
+| Liquid capital below the territory minimum; sold territory | blocked |
+| Form says Texas, free text says Miami | needs review |
+| Missing unit state; ZIP from another state; ZIP typo; no financials | needs review |
+| "florida", "Fl.", ZIP+4, "$200k" | read correctly, assigned |
+| Language nobody in the state speaks | assigned in English, with a note |
+| Same contact submits again with a changed answer | needs review, never a second seat |
+| Two leads race for a rep's last seat | exactly one gets it |
 
 ## Layout
 

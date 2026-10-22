@@ -51,10 +51,12 @@ app.post('/webhooks/lead', async (req, res) => {
     res.json(result);
   } catch (error) {
     if (error instanceof ZodError) {
+      // Field names and reasons only, never values (they hold personal data)
+      console.warn('[webhook] lead rejected:', error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '));
       res.status(400).json({ error: 'invalid payload', issues: error.issues });
       return;
     }
-    // 500 makes GHL retry; the event was un-claimed, so the retry is processed.
+    // 500 makes GHL retry; the event is kept as 'failed', so the retry processes it.
     console.error('[webhook] routing failed:', error);
     res.status(500).json({ error: 'routing failed' });
   }
@@ -85,6 +87,7 @@ app.post('/webhooks/opportunity', async (req, res) => {
     res.json({ seat });
   } catch (error) {
     if (error instanceof ZodError) {
+      console.warn('[webhook] opportunity change rejected:', error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '));
       res.status(400).json({ error: 'invalid payload', issues: error.issues });
       return;
     }

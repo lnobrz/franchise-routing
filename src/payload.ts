@@ -49,7 +49,13 @@ export const OpportunityPayloadSchema = z.object({
   opportunity_id: ghlId,
   // Lets the seat be found when the opportunity id was never recorded
   contact_id: ghlId.optional().or(z.literal('').transform(() => undefined)),
-  status: z.string().trim().toLowerCase().pipe(z.enum(['open', 'won', 'lost', 'abandoned'])),
+  // GHL's UI and merge field say "Abandon"; the API says "abandoned". Both mean the same.
+  status: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .transform((s) => (s === 'abandon' ? 'abandoned' : s))
+    .pipe(z.enum(['open', 'won', 'lost', 'abandoned'])),
   // GHL's opportunity merge fields expose the assigned user's id, not their
   // e-mail; either works, the id is looked up in the CRM's user list.
   assigned_to_email: optionalText,

@@ -230,6 +230,19 @@ export class Db {
     if (error) throw new Error(`setOpenLeads: ${error.message}`);
   }
 
+  /** Gives back the seat a contact holds, the same way a lost opportunity does. */
+  async releaseSeatOfContact(contactId: string): Promise<SeatChange | null> {
+    const { data, error } = await this.sb
+      .from('rep_seats')
+      .select('opportunity_id')
+      .eq('contact_id', contactId)
+      .is('released_at', null)
+      .maybeSingle();
+    if (error) throw new Error(`releaseSeatOfContact: ${error.message}`);
+    if (!data) return null;
+    return this.opportunityChanged(data.opportunity_id ?? `none:${contactId}`, 'lost', null, contactId);
+  }
+
   async repByEmail(email: string): Promise<RepRow | null> {
     const { data, error } = await this.sb.from('reps').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error(`repByEmail: ${error.message}`);
