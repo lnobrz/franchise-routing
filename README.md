@@ -143,10 +143,8 @@ go to Carlos last week?" is one query.
 ## Setup
 
 1. **Supabase:** run `supabase/schema.sql`, then `supabase/seed.sql` in the SQL editor.
-   A database created with an earlier version only needs the files in
-   `supabase/migrations/`, in order. After `001`, set each rep's `open_leads` to
-   their real number of open leads, since seats taken before it aren't linked to
-   an opportunity.
+   `schema.sql` describes the whole database as it is in production. A change to a
+   database already in use needs a migration (the Supabase CLI can generate one).
 2. **GoHighLevel:** custom fields, the inquiry form, a pipeline, and users whose
    e-mails match the `reps` table. Create a Private Integration token with
    contacts, opportunities, users and custom fields scopes.
@@ -263,7 +261,6 @@ src/
   db.ts                  Supabase access
 supabase/
   schema.sql             tables, constraints, claims, seats, RLS
-  migrations/            upgrades for databases created earlier
   seed.sql               demo data
 scripts/simulate.ts      end-to-end scenarios against a running server
 ```
