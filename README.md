@@ -226,6 +226,10 @@ npm run simulate            # creates test contacts in GHL and fires real webhoo
 npm run simulate -- zip-typo  # one scenario by name
 ```
 
+GitHub Actions runs the type check and `npm test` on every pull request and on
+pushes to `master` (`.github/workflows/ci.yml`). The simulator is not part of CI,
+since it writes to the real CRM.
+
 The simulator checks every outcome and exits with 1 if any scenario routes
 differently than expected, so it can run before each deploy. It gives back the
 seats it took. Its expectations match `supabase/seed.sql`. Scenarios:
